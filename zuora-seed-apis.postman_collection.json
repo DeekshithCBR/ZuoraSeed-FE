@@ -1,0 +1,207 @@
+{
+    "info": {
+      "_postman_id": "00000000-0000-0000-0000-000000000000",
+      "name": "Zuora Seed – Seed API + Zuora Payloads",
+      "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+    "variable": [
+      {
+        "key": "seed_api_base",
+        "value": "https://<your-api-id>.execute-api.<region>.amazonaws.com/demo",
+        "type": "string"
+      },
+      {
+        "key": "persona",
+        "value": "ProjectManager",
+        "type": "string"
+      },
+      {
+        "key": "conversation_id",
+        "value": "1234",
+        "type": "string"
+      },
+      {
+        "key": "zuora_base_url",
+        "value": "https://rest.test.zuora.com",
+        "type": "string"
+      },
+      {
+        "key": "zuora_oauth_token",
+        "value": "",
+        "type": "string"
+      }
+    ],
+    "item": [
+      {
+        "name": "Seed Backend – Chat",
+        "description": "AWS API Gateway/Lambda chat endpoint used by the frontend.",
+        "item": [
+          {
+            "name": "POST /chat – Send message",
+            "request": {
+              "method": "POST",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": {
+                "mode": "raw",
+                "raw": "{\n  \"persona\": \"{{persona}}\",\n  \"message\": \"I want to create a product called Gold Tier\",\n  \"conversation_id\": \"{{conversation_id}}\"\n}"
+              },
+              "url": {
+                "raw": "{{seed_api_base}}/chat",
+                "host": [
+                  "{{seed_api_base}}"
+                ],
+                "path": [
+                  "chat"
+                ]
+              },
+              "description": "Main chat endpoint.\n\nVariables:\n- {{seed_api_base}} – API Gateway base URL, including /demo\n- {{persona}} – e.g. ProjectManager, Architect\n- {{conversation_id}} – any stable ID per front-end session"
+            },
+            "response": []
+          }
+        ]
+      },
+      {
+        "name": "Zuora – Catalog Setup (Example Payloads)",
+        "description": "Example REST calls that Seed will eventually plan/execute for Zuora catalog and orders. Adjust bodies to match your tenant & latest Zuora docs.",
+        "item": [
+          {
+            "name": "Create Product – API Credits Wallet",
+            "request": {
+              "method": "POST",
+              "header": [
+                {
+                  "key": "Authorization",
+                  "value": "Bearer {{zuora_oauth_token}}"
+                },
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": {
+                "mode": "raw",
+                "raw": "{\n  \"Name\": \"API Credits Wallet\",\n  \"SKU\": \"API-WALLET-100\",\n  \"EffectiveStartDate\": \"2025-12-01\",\n  \"Description\": \"Prepaid drawdown wallet product for API_CALL credits\",\n  \"Category\": \"Base Products\",\n  \"Active\": true\n}"
+              },
+              "url": {
+                "raw": "{{zuora_base_url}}/v1/object/product",
+                "host": [
+                  "{{zuora_base_url}}"
+                ],
+                "path": [
+                  "v1",
+                  "object",
+                  "product"
+                ]
+              },
+              "description": "Creates the base Zuora Product for the API Credits Wallet scenario.\nUpdate the fields as needed for your tenant."
+            },
+            "response": []
+          },
+          {
+            "name": "Create Rate Plan – Wallet Monthly",
+            "request": {
+              "method": "POST",
+              "header": [
+                {
+                  "key": "Authorization",
+                  "value": "Bearer {{zuora_oauth_token}}"
+                },
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": {
+                "mode": "raw",
+                "raw": "{\n  \"Name\": \"Wallet Monthly\",\n  \"ProductId\": \"{{PRODUCT_ID}}\",\n  \"Description\": \"Monthly prepayment wallet plan\"\n}"
+              },
+              "url": {
+                "raw": "{{zuora_base_url}}/v1/object/product-rate-plan",
+                "host": [
+                  "{{zuora_base_url}}"
+                ],
+                "path": [
+                  "v1",
+                  "object",
+                  "product-rate-plan"
+                ]
+              },
+              "description": "Creates the Wallet Monthly rate plan attached to the product.\nReplace {{PRODUCT_ID}} with the ID from the Create Product response."
+            },
+            "response": []
+          },
+          {
+            "name": "Create Charge – Recurring Prepayment",
+            "request": {
+              "method": "POST",
+              "header": [
+                {
+                  "key": "Authorization",
+                  "value": "Bearer {{zuora_oauth_token}}"
+                },
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": {
+                "mode": "raw",
+                "raw": "{\n  \"Name\": \"Prepayment – 100k credits\",\n  \"ProductRatePlanId\": \"{{RP_WALLET_MONTHLY_ID}}\",\n  \"ChargeModel\": \"FlatFee\",\n  \"BillingPeriod\": \"Month\",\n  \"Price\": 500,\n  \"Currency\": \"USD\"\n}"
+              },
+              "url": {
+                "raw": "{{zuora_base_url}}/v1/object/product-rate-plan-charge",
+                "host": [
+                  "{{zuora_base_url}}"
+                ],
+                "path": [
+                  "v1",
+                  "object",
+                  "product-rate-plan-charge"
+                ]
+              },
+              "description": "Simplified example of a recurring prepayment charge. Extend with multi-currency and wallet metadata as needed."
+            },
+            "response": []
+          },
+          {
+            "name": "Create Subscription Order – Wallet Monthly",
+            "request": {
+              "method": "POST",
+              "header": [
+                {
+                  "key": "Authorization",
+                  "value": "Bearer {{zuora_oauth_token}}"
+                },
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": {
+                "mode": "raw",
+                "raw": "{\n  \"orderDate\": \"2025-12-01\",\n  \"existingAccountNumber\": \"A00000001\",\n  \"subscriptions\": [\n    {\n      \"orderActions\": [\n        {\n          \"type\": \"CreateSubscription\",\n          \"createSubscription\": {\n            \"terms\": {\n              \"initialTerm\": { \"period\": 12, \"periodType\": \"Month\", \"termType\": \"TERMED\" },\n              \"renewalSetting\": \"RENEW_WITH_SPECIFIC_TERM\",\n              \"renewalTerms\": [{ \"period\": 12, \"periodType\": \"Month\" ]\n            },\n            \"subscribeToRatePlans\": [\n              {\n                \"productRatePlanId\": \"{{RP_WALLET_MONTHLY_ID}}\"\n              }\n            ]\n          }\n        }\n      ]\n    }\n  ]\n}"
+              },
+              "url": {
+                "raw": "{{zuora_base_url}}/v1/orders",
+                "host": [
+                  "{{zuora_base_url}}"
+                ],
+                "path": [
+                  "v1",
+                  "orders"
+                ]
+              },
+              "description": "Example CreateSubscription order using the Wallet Monthly rate plan.\nMatch the structure to your latest Zuora Orders API specification."
+            },
+            "response": []
+          }
+        ]
+      }
+    ]
+  }
+  
