@@ -1,6 +1,8 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
+import { useRouter } from "next/navigation";
+
 import Link from "next/link";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -21,6 +23,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import {
+  Home,
   Bell,
   HelpCircle,
   User,
@@ -184,10 +187,15 @@ function Toast({ message, onClose }: { message: string; onClose: () => void }) {
 
 export default function WorkflowPage() {
   const [isConnected, setIsConnected] = useState(false);
+  const [zuoraGeneratedBody, setZuoraGeneratedBody] = useState(null);
+const [showConnectedCard, setShowConnectedCard] = useState(false);
+
   const [environment, setEnvironment] = useState("");
   const [clientId, setClientId] = useState("");
   const [clientSecret, setClientSecret] = useState("");
   const [currentFlow, setCurrentFlow] = useState<ConversationFlow>("idle");
+  const [executing, setExecuting] = useState(false);
+
   const [createProductStep, setCreateProductStep] =
     useState<CreateProductStep>("name");
   const [highlightConnect, setHighlightConnect] = useState(false);
@@ -238,6 +246,7 @@ export default function WorkflowPage() {
     ratePlanIds: string[];
     chargeIds: string[];
   } | null>(null);
+  const router = useRouter();
 
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
     {
@@ -250,6 +259,65 @@ export default function WorkflowPage() {
   const [chatInput, setChatInput] = useState("");
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [showPayload, setShowPayload] = useState(false);
+  const [apiPayloadText, setApiPayloadText] = useState<string | null>(null);
+
+  // ---- Conversation ID utilities ----
+  const CONV_STORAGE_PREFIX = "pm_conversation_id";
+
+  const sanitizeConvId = (id?: string | null) => {
+    if (!id) return null;
+    const trimmed = String(id).trim();
+    if (!trimmed || trimmed === "null" || trimmed === "undefined") return null;
+    // clean up any accidental suffixes like "198"
+    return trimmed.replace(/198$/, "");
+  };
+
+  const newConversationId = () => {
+    const base =
+      typeof crypto !== "undefined" && (crypto as any).randomUUID
+        ? (crypto as any).randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    return `conv-${base}`;
+  };
+
+  const storageKeyForPersona = (persona: string) => {
+    const path =
+      typeof window !== "undefined" ? window.location.pathname : "root";
+    return `${CONV_STORAGE_PREFIX}:${persona}:${path}`;
+  };
+
+  const getOrCreateConversationId = (
+    persona: string,
+    opts?: { forceNew?: boolean }
+  ) => {
+    if (typeof window === "undefined") {
+      // SSR fallback – will be replaced on client
+      return `conv-${Date.now()}`;
+    }
+
+    const key = storageKeyForPersona(persona);
+
+    // migrate old key if it exists (legacy: "pm_conversation_id")
+    const legacy = sanitizeConvId(sessionStorage.getItem("pm_conversation_id"));
+    if (legacy) {
+      sessionStorage.removeItem("pm_conversation_id");
+      sessionStorage.setItem(key, legacy);
+    }
+
+    if (opts?.forceNew) {
+      const fresh = newConversationId();
+      sessionStorage.setItem(key, fresh);
+      return fresh;
+    }
+
+    const existing = sanitizeConvId(sessionStorage.getItem(key));
+    if (existing) return existing;
+
+    const created = newConversationId();
+    sessionStorage.setItem(key, created);
+    return created;
+  };
+
   const [isUserAtBottom, setIsUserAtBottom] = useState(true);
   const [showNewMessagesPill, setShowNewMessagesPill] = useState(false);
   const [completedFlows, setCompletedFlows] = useState<CompletedFlow[]>([]);
@@ -262,18 +330,11 @@ export default function WorkflowPage() {
 
   // [CHAT-API] Persona + Conversation ID
   const CHAT_API_URL =
-    "https://f5p7n15yh0.execute-api.us-east-2.amazonaws.com/demo/chat";
+    "https://7ajwemkf19.execute-api.us-east-2.amazonaws.com/demo/chat";
   const CHAT_PERSONA = "ProductManager";
+
   const [conversationId, setConversationId] = useState<string>(() => {
-    // try to persist across refreshes in the same tab
-    if (typeof window !== "undefined") {
-      const existing = sessionStorage.getItem("pm_conversation_id");
-      if (existing) return existing;
-      const created = crypto?.randomUUID?.() || `conv-${Date.now()}`;
-      sessionStorage.setItem("pm_conversation_id", created);
-      return created;
-    }
-    return `conv-${Date.now()}`;
+    return getOrCreateConversationId(CHAT_PERSONA);
   });
 
   const scrollToBottom = (smooth = true) => {
@@ -325,6 +386,15 @@ export default function WorkflowPage() {
       setShowNewMessagesPill(true);
     }
   }, [chatMessages, isUserAtBottom]);
+
+  useEffect(() => {
+  if (isConnected && currentFlow === "idle") {
+    setShowConnectedCard(true);
+    const t = setTimeout(() => setShowConnectedCard(false), 10_000);
+    return () => clearTimeout(t);
+  }
+}, [isConnected, currentFlow]);
+
 
   useEffect(() => {
     const chatContainer = chatContainerRef.current;
@@ -390,6 +460,9 @@ export default function WorkflowPage() {
   const sendChatToApi = async (message: string) => {
     try {
       setIsTyping(true);
+      const safeConvId =
+        sanitizeConvId(conversationId) ??
+        getOrCreateConversationId(CHAT_PERSONA);
 
       const res = await fetch(CHAT_API_URL, {
         method: "POST",
@@ -397,11 +470,11 @@ export default function WorkflowPage() {
         body: JSON.stringify({
           persona: CHAT_PERSONA,
           message,
-          conversation_id: conversationId,
+          conversation_id: safeConvId,
         }),
       });
 
-      // read as text first (handles non-JSON error bodies)
+      // Read as text first (defensive against non-JSON error bodies)
       const raw = await res.text();
       let data: any = {};
       try {
@@ -410,7 +483,7 @@ export default function WorkflowPage() {
         // leave data as {}
       }
 
-      // accept common shapes: prefer `answer`, then others
+      // Accept common shapes: prefer `answer`, then others
       const reply: string =
         data?.answer ??
         data?.reply ??
@@ -421,7 +494,7 @@ export default function WorkflowPage() {
           ? "(No reply content)"
           : `Error: ${res.status} ${res.statusText}`);
 
-      // pick up conversation id if backend returns/changes it
+      // Pick up conversation id if backend returns/changes it
       const returnedConvId =
         data?.conversation_id || data?.conversationId || data?.conv_id;
       if (returnedConvId && returnedConvId !== conversationId) {
@@ -431,7 +504,7 @@ export default function WorkflowPage() {
         }
       }
 
-      // optional: show citations compactly if provided
+      // Optional: show citations compactly if provided
       let citationsSuffix = "";
       if (Array.isArray(data?.citations) && data.citations.length > 0) {
         const firstThree = data.citations.slice(0, 3);
@@ -443,6 +516,51 @@ export default function WorkflowPage() {
         citationsSuffix = `\n\n— sources: ${labels}${more}`;
       }
 
+      // === NEW: If the API returned a zuora_api_payload, open the Product Payload Preview ===
+      const payload = data?.zuora_api_payload;
+      if (payload && (payload.body || payload.endpoint || payload.method)) {
+
+        if (payload.body) {
+          setZuoraGeneratedBody(payload.body);
+          console.log("💾 Stored generated Zuora body:", payload.body);
+        }
+        // Pretty object for the right-panel preview card
+        const pretty = JSON.stringify(
+          {
+            endpoint: payload.endpoint ?? "",
+            method: payload.method ?? "",
+            params: payload.params ?? {},
+            body: payload.body ?? {},
+            missing_params: payload.missing_params ?? [],
+            notes: payload.notes ?? "",
+          },
+          null,
+          2
+        );
+
+        // Save pretty text so the preview card shows API-provided payload
+        setApiPayloadText(pretty);
+
+        // Optionally prefill local productData from the body (only if keys exist)
+        if (payload.body && typeof payload.body === "object") {
+          setProductData((prev) => ({
+            ...prev,
+            name: payload.body.name ?? prev.name,
+            sku: payload.body.sku ?? prev.sku,
+            description: payload.body.description ?? prev.description,
+            // productFamily is not in ProductData type; ignore or extend the type if you need it
+          }));
+        }
+
+        // Tell the chat and open the preview card
+        addAssistantMessage(
+          "I generated a Zuora API payload draft. Opening preview…",
+          200
+        );
+        handleGeneratePayload();
+      }
+
+      // Append the normal assistant reply (with compact citations if any)
       setChatMessages((prev) => [
         ...prev,
         {
@@ -469,22 +587,25 @@ export default function WorkflowPage() {
 
   const ZUORA_ENV_BASE: Record<string, string> = {
     "api-sandbox": "https://rest.test.zuora.com",
-    "sandbox": "https://rest.test.zuora.com",
-    "production": "https://rest.zuora.com",
+    sandbox: "https://rest.test.zuora.com",
+    production: "https://rest.zuora.com",
   };
-  
+
   const ZUORA_TOKEN_URL =
-    "https://f5p7n15yh0.execute-api.us-east-2.amazonaws.com/demo/zuora-token";
-  
+    "https://7ajwemkf19.execute-api.us-east-2.amazonaws.com/demo/zuora-token";
+
   const handleConnect = async () => {
     if (!validateConnectForm()) {
-      addAssistantMessage("Please fix the highlighted errors and try again.", 200);
+      addAssistantMessage(
+        "Please fix the highlighted errors and try again.",
+        200
+      );
       return;
     }
-  
+
     try {
       setConnecting(true);
-  
+
       // POST to your token service directly from the browser.
       // IMPORTANT: do NOT hardcode secrets in source — use the form inputs you already have.
       const res = await fetch(ZUORA_TOKEN_URL, {
@@ -497,12 +618,16 @@ export default function WorkflowPage() {
           environment, // safe for server to decide Zuora base
         }),
       });
-  
+
       // Read as text first, then parse (defensive against non-JSON errors)
       const raw = await res.text();
       let data: any = {};
-      try { data = raw ? JSON.parse(raw) : {}; } catch { /* keep empty */ }
-  
+      try {
+        data = raw ? JSON.parse(raw) : {};
+      } catch {
+        /* keep empty */
+      }
+
       // Accept a few common shapes and normalize
       const accessToken =
         data.accessToken || data.access_token || data.token || null;
@@ -513,7 +638,7 @@ export default function WorkflowPage() {
         data.base_url ||
         // fallback by environment if service doesn't return base URL
         ZUORA_ENV_BASE[environment as keyof typeof ZUORA_ENV_BASE];
-  
+
       if (!res.ok || !accessToken) {
         const reason =
           data?.error_description ||
@@ -529,7 +654,7 @@ export default function WorkflowPage() {
         );
         return;
       }
-  
+
       setIsConnected(true);
       setTokenInfo({
         accessToken,
@@ -551,7 +676,6 @@ export default function WorkflowPage() {
       setConnecting(false);
     }
   };
-  
 
   const handleQuickAction = (action: ConversationFlow) => {
     if (!isConnected && action !== "idle") {
@@ -586,9 +710,7 @@ export default function WorkflowPage() {
       setCreateProductStep("name");
     } else if (action === "update-product") {
       setUpdateProductStep("identify");
-
     } else if (action === "expire-product") {
-
     } else if (action === "view-product") {
       setViewProductStep("choose-scope");
       addAssistantMessage(
@@ -666,9 +788,7 @@ export default function WorkflowPage() {
     }, 300);
   };
 
-  const handleCreateProductFlow = (input: string) => {
-
-  };
+  const handleCreateProductFlow = (input: string) => {};
 
   const handleUpdateProductFlow = (input: string) => {
     if (updateProductStep === "identify") {
@@ -1089,46 +1209,104 @@ export default function WorkflowPage() {
     }, 300);
   };
 
-  const handleExecute = () => {
-    setCreateProductStep("execute");
-    setTimeout(() => {
-      addAssistantMessage("Creating product in Zuora...");
 
-      setTimeout(() => {
-        const result = {
-          productId:
-            "PROD-" + Math.random().toString(36).substr(2, 9).toUpperCase(),
-          ratePlanIds: productData.ratePlans.map(
-            () => "RP-" + Math.random().toString(36).substr(2, 9).toUpperCase()
-          ),
-          chargeIds: productData.ratePlans.flatMap((rp) =>
-            rp.charges.map(
-              () =>
-                "CHG-" + Math.random().toString(36).substr(2, 9).toUpperCase()
-            )
-          ),
-        };
-        setExecutionResult(result);
+  // Build correct Zuora Product JSON with cleanup
+const buildZuoraBody = () => {
+  const raw = {
+    Name: productData?.name ?? null,
+    Description: productData?.description ?? null,
+    EffectiveStartDate: productData?.startDate ?? null,
+    EffectiveEndDate: "2099-12-31",
+    SKU: productData?.sku ?? null,
 
-        addAssistantMessage(
-          `✅ Created!\n\nProductId: ${
-            result.productId
-          }\nRatePlanIds: ${result.ratePlanIds.join(
-            ", "
-          )}\nChargeIds: ${result.chargeIds.join(
-            ", "
-          )}\n\nWhat would you like to do next?\n1. Create subscription\n2. Add more plans\n3. Go home`
-        );
-
-        setToastMessage("Product created successfully in Zuora!");
-
-        setTimeout(() => {
-          completeCurrentFlow();
-        }, 3000);
-      }, 2000);
-    }, 300);
+    // FULL RATE PLAN & CHARGES MAPPING
+    ProductRatePlans: (productData?.ratePlans || []).map((rp) => ({
+      Name: rp.name,
+      Description: rp.description || "",
+      ProductRatePlanCharges: (rp.charges || []).map((ch) => ({
+        Name: ch.name,
+        ChargeType: ch.type,
+        Fields: ch.fields || {}
+      }))
+    }))
   };
 
+  // CLEANUP — remove null, empty string, undefined, empty arrays
+  Object.keys(raw).forEach((k) => {
+    const v = raw[k];
+    if (
+      v === null ||
+      v === undefined ||
+      v === "" ||
+      (Array.isArray(v) && v.length === 0)
+    ) {
+      delete raw[k];
+    }
+  });
+
+  return raw;
+};
+
+
+
+const handleExecute = async () => {
+  if (!clientId || !clientSecret) {
+    setToastMessage("Client ID/Secret required to create product");
+    addAssistantMessage("Please enter Client ID and Client Secret.");
+    return;
+  }
+
+  if (!zuoraGeneratedBody) {
+    setToastMessage("No generated Zuora body found.");
+    addAssistantMessage("I could not find the generated product payload.");
+    return;
+  }
+
+  setCreateProductStep("execute");
+  setExecuting(true);
+  addAssistantMessage("Creating product in Zuora…");
+
+  try {
+    const payload = {
+      clientId,
+      clientSecret,
+      body: zuoraGeneratedBody    // ⭐ USE THE GENERATED BODY
+    };
+
+    console.log("🔥 FINAL PAYLOAD SENT TO ZUORA:");
+    console.log(JSON.stringify(payload, null, 2));
+
+    const res = await fetch(
+      "https://7ajwemkf19.execute-api.us-east-2.amazonaws.com/demo/zuora/product",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      }
+    );
+
+    const raw = await res.text();
+    let data = {};
+    try { data = JSON.parse(raw); } catch {}
+
+    if (!res.ok) {
+      throw new Error(data?.error || data?.message || `${res.status}`);
+    }
+
+    addAssistantMessage(`✅ Product created successfully!\nProductId: ${data.Id}`);
+    setToastMessage("Product created successfully!");
+
+  } catch (err: any) {
+    addAssistantMessage("❌ Product creation failed.");
+    setToastMessage(err.message);
+  } finally {
+    setExecuting(false);
+  }
+};
+
+
+
+  
   const generateProductPayload = () => {
     const payload = {
       name: productData.name,
@@ -1276,6 +1454,16 @@ export default function WorkflowPage() {
       <header className="border-b border-gray-200 bg-slate-800 text-white">
         <div className="flex h-14 items-center justify-between px-6">
           <div className="flex items-center gap-6">
+            <Button
+              variant="ghost"
+              size="icon"
+              className="text-gray-300 hover:text-white"
+              onClick={() => router.push("/")}
+              aria-label="Home"
+            >
+              <Home className="h-5 w-5" />
+            </Button>
+
             <Link href="/" className="flex items-center gap-2">
               <span className="text-xl font-bold">Zuora Seed</span>
               <Badge className="bg-cyan-500 text-xs font-semibold hover:bg-cyan-500">
@@ -1586,11 +1774,12 @@ export default function WorkflowPage() {
                         </div>
                       ))}
                       <Button
-                        className="mt-4 w-full bg-green-600 hover:bg-green-700"
+                        className="mt-4 w-full bg-green-600 hover:bg-green-700 disabled:opacity-60"
                         onClick={handleExecute}
+                        disabled={executing}
                       >
                         <CheckCircle2 className="mr-2 h-4 w-4" />
-                        Create Product in Zuora
+                        {executing ? "Creating..." : "Create Product in Zuora"}
                       </Button>
                     </CardContent>
                   </Card>
@@ -2047,8 +2236,9 @@ export default function WorkflowPage() {
                   </CardHeader>
                   <CardContent>
                     <pre className="overflow-x-auto rounded-lg bg-slate-900 p-4 text-sm text-green-400">
-                      {generateProductPayload()}
+                      {apiPayloadText ?? generateProductPayload()}
                     </pre>
+
                     <div className="mt-4 flex gap-2">
                       <Button
                         className="bg-[#2B6CF3] hover:bg-[#2456c9]"
@@ -2068,63 +2258,29 @@ export default function WorkflowPage() {
                 </Card>
               )}
 
-              {currentFlow === "idle" && !showPayload && (
-                <div className="mx-auto max-w-2xl">
-                  <Card className="border-green-200 bg-green-50">
-                    <CardContent className="flex items-center gap-3 p-6">
-                      <CheckCircle2 className="h-8 w-8 text-green-600" />
-                      <div>
-                        <h3 className="text-lg font-semibold text-green-900">
-                          ✅ Connected to Zuora
-                        </h3>
-                        <p className="text-sm text-green-700">
-                          Environment:{" "}
-                          {environment === "api-sandbox"
-                            ? "API Sandbox"
-                            : environment === "sandbox"
-                            ? "Sandbox / Test"
-                            : "Production"}
-                        </p>
-                      </div>
-                    </CardContent>
-                  </Card>
+    {isConnected && showConnectedCard && currentFlow === "idle" && !showPayload && (
+  <div className="mx-auto max-w-2xl">
+    <Card className="border-green-200 bg-green-50">
+      <CardContent className="flex items-center gap-3">
+        <CheckCircle2 className="h-8 w-8 text-green-600" />
+        <div>
+          <h3 className="text-lg font-semibold text-green-900">
+            ✅ Connected to Zuora
+          </h3>
+          <p className="text-sm text-green-700">
+            Environment:{" "}
+            {environment === "api-sandbox"
+              ? "API Sandbox"
+              : environment === "sandbox"
+              ? "Sandbox / Test"
+              : "Production"}
+          </p>
+        </div>
+      </CardContent>
+    </Card>
+  </div>
+)}
 
-                  <div className="mt-8">
-                    <h3 className="mb-4 text-lg font-semibold text-gray-900">
-                      Quick Actions
-                    </h3>
-                    <div className="grid gap-4 sm:grid-cols-2">
-                      <Button
-                        variant="outline"
-                        className="h-auto flex-col items-start gap-2 p-4 hover:border-[#2B6CF3] hover:bg-blue-50 bg-transparent"
-                        onClick={() => startActionWithChat("create-product")}
-                      >
-                        <Package className="h-6 w-6 text-[#2B6CF3]" />
-                        <div className="text-left">
-                          <div className="font-semibold">Create Product</div>
-                          <div className="text-xs text-gray-600">
-                            Add a new product to your catalog
-                          </div>
-                        </div>
-                      </Button>
-
-                      <Button
-                        variant="outline"
-                        className="h-auto flex-col items-start gap-2 p-4 hover:border-[#2B6CF3] hover:bg-blue-50 bg-transparent"
-                        onClick={() => startActionWithChat("view-product")}
-                      >
-                        <Eye className="h-6 w-6 text-[#2B6CF3]" />
-                        <div className="text-left">
-                          <div className="font-semibold">View Product</div>
-                          <div className="text-xs text-gray-600">
-                            Browse your product catalog
-                          </div>
-                        </div>
-                      </Button>
-                    </div>
-                  </div>
-                </div>
-              )}
             </div>
           )}
         </div>
