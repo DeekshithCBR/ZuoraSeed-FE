@@ -357,6 +357,7 @@ export default function WorkflowPage() {
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [showPayload, setShowPayload] = useState(false);
   const [apiPayloadText, setApiPayloadText] = useState<string | null>(null);
+  const [isPayloadExpanded, setIsPayloadExpanded] = useState(true);
 
   // ---- Conversation ID utilities ----
   const CONV_STORAGE_PREFIX = "pm_conversation_id";
@@ -1622,16 +1623,11 @@ export default function WorkflowPage() {
     return raw;
   };
 
+
   const handleExecute = async () => {
     if (!clientId || !clientSecret) {
       setToastMessage("Client ID/Secret required to create product");
       addAssistantMessage("Please enter Client ID and Client Secret.");
-      return;
-    }
-  
-    if (!zuoraGeneratedBody) {
-      setToastMessage("No generated Zuora body found.");
-      addAssistantMessage("I could not find the generated product payload.");
       return;
     }
   
@@ -1640,10 +1636,38 @@ export default function WorkflowPage() {
     addAssistantMessage("Creating product in Zuora…");
   
     try {
+      // 🔹 1) Decide which body to send: edited JSON (apiPayloadText) or fallback to zuoraGeneratedBody
+      let effectiveBody: any = zuoraGeneratedBody;
+  
+      if (apiPayloadText) {
+        try {
+          const parsed = JSON.parse(apiPayloadText);
+          effectiveBody = parsed;
+          // keep state in sync with the edited payload
+          setZuoraGeneratedBody(parsed);
+        } catch (e) {
+          setToastMessage(
+            "Payload JSON is invalid. Please fix it before creating."
+          );
+          addAssistantMessage(
+            "Your edited payload is not valid JSON. Please correct it in the preview panel and try again."
+          );
+          setExecuting(false);
+          return;
+        }
+      }
+  
+      if (!effectiveBody) {
+        setToastMessage("No generated Zuora body found.");
+        addAssistantMessage("I could not find the generated product payload.");
+        setExecuting(false);
+        return;
+      }
+  
       const payload = {
         clientId,
         clientSecret,
-        body: zuoraGeneratedBody, // unified body with product + ratePlans
+        body: effectiveBody, // 🔥 uses edited JSON if present
       };
   
       console.log("🔥 FINAL PAYLOAD SENT TO ZUORA:");
@@ -1663,14 +1687,14 @@ export default function WorkflowPage() {
       try {
         data = JSON.parse(raw);
       } catch {
-        /* ignore parse error, will fall back below */
+        /* ignore parse errors, fall back on raw */
       }
   
       if (!res.ok) {
         throw new Error(data?.error || data?.message || `${res.status}`);
       }
   
-      // ---- NEW: map API response → IDs ----
+      // ---- map API response → IDs (same as before) ----
       const productId: string | undefined =
         data.productId || data.Id || data.id;
   
@@ -1686,14 +1710,12 @@ export default function WorkflowPage() {
             .filter(Boolean)
         : [];
   
-      // store in state if you want to show in a card later
       setExecutionResult({
         productId: productId ?? "",
         ratePlanIds,
         chargeIds,
       });
   
-      // build nice chat message with IDs
       let msg =
         data.message ||
         "✅ Product + RatePlans + Charges created successfully!";
@@ -1718,6 +1740,8 @@ export default function WorkflowPage() {
       setExecuting(false);
     }
   };
+
+  
   
 
   const generateProductPayload = () => {
@@ -2677,37 +2701,55 @@ const handleCopyPayload = async () => {
             </div>
           ) : (
             <div>
-              {showPayload && (
-                <Card className="mb-6">
-                  <CardHeader>
-                    <CardTitle>Product Payload Preview</CardTitle>
-                    <CardDescription>
-                      JSON payload ready to send to Zuora API
-                    </CardDescription>
-                  </CardHeader>
-                  <CardContent>
-                    <pre className="overflow-x-auto rounded-lg bg-slate-900 p-4 text-sm text-green-400">
-                      {apiPayloadText ?? generateProductPayload()}
-                    </pre>
+        {showPayload && (
+  <Card className="mb-6">
+    <CardHeader
+      className="flex cursor-pointer items-center justify-between"
+      onClick={() => setIsPayloadExpanded((prev) => !prev)}
+    >
+      <div>
+        <CardTitle>Product Payload Preview</CardTitle>
+        <CardDescription>
+          JSON payload ready to send to Zuora API (editable)
+        </CardDescription>
+      </div>
+      <ChevronDown
+        className={`h-4 w-4 text-gray-500 transition-transform ${
+          isPayloadExpanded ? "rotate-180" : ""
+        }`}
+      />
+    </CardHeader>
 
-                    <div className="mt-4 flex gap-2">
-                      <Button
-                        className="bg-[#2B6CF3] hover:bg-[#2456c9]"
-                        onClick={handleValidation}
-                      >
-                        Validate & Deploy
-                      </Button>
-                      <Button
-                        variant="outline"
-                        onClick={handleCopyPayload}
-                        disabled={copying}
-                      >
-                        {copying ? "Copying…" : "Copy to Clipboard"}
-                      </Button>
-                    </div>
-                  </CardContent>
-                </Card>
-              )}
+    {isPayloadExpanded && (
+      <CardContent>
+        {/* Editable JSON textarea */}
+        <textarea
+          className="h-64 w-full resize-y rounded-lg border border-slate-700 bg-slate-900 p-4 font-mono text-xs text-green-400 outline-none"
+          value={apiPayloadText ?? generateProductPayload()}
+          onChange={(e) => setApiPayloadText(e.target.value)}
+          spellCheck={false}
+        />
+
+        <div className="mt-4 flex gap-2">
+          <Button
+            className="bg-[#2B6CF3] hover:bg-[#2456c9]"
+            onClick={handleValidation}
+          >
+            Validate &amp; Deploy
+          </Button>
+          <Button
+            variant="outline"
+            onClick={handleCopyPayload}
+            disabled={copying}
+          >
+            {copying ? "Copying…" : "Copy to Clipboard"}
+          </Button>
+        </div>
+      </CardContent>
+    )}
+  </Card>
+)}
+
 
               {isConnected &&
                 showConnectedCard &&
