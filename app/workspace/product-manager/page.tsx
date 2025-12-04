@@ -388,6 +388,9 @@ export default function WorkflowPage() {
   const [isConnected, setIsConnected] = useState(false);
   const [showConnectedCard, setShowConnectedCard] = useState(false);
   const [zuoraSteps, setZuoraSteps] = useState<ZuoraStep[]>([]);
+  const [conversationPayloads, setConversationPayloads] = useState<{
+    [convId: string]: ZuoraPayloadItem[];
+  }>({});
   // Stores the array [{ zuora_api_type, payload }]
   const [persistedZuoraPayloads, setPersistedZuoraPayloads] = useState<
     ZuoraPayloadItem[]
@@ -888,8 +891,6 @@ export default function WorkflowPage() {
   };
 
   // [CHAT-API] Send user message to backend and append assistant reply
-
-  // [CHAT-API] Send user message to backend and append assistant reply
   const sendChatToApi = async (message: string) => {
     try {
       setIsTyping(true);
@@ -905,7 +906,7 @@ export default function WorkflowPage() {
           persona: CHAT_PERSONA,
           message,
           conversation_id: safeConvId,
-          zuora_api_payloads: persistedZuoraPayloads,
+          zuora_api_payloads: conversationPayloads[safeConvId] || [], // ⬅️ Scopes payload per conversation
         }),
       });
 
@@ -914,10 +915,12 @@ export default function WorkflowPage() {
       try {
         data = raw ? JSON.parse(raw) : {};
       } catch {
-        // leave data as {}
+        // ignore
       }
 
-      // --------- Main reply text ---------
+      // --------------------------
+      // MAIN REPLY
+      // --------------------------
       const reply: string =
         data?.answer ??
         data?.reply ??
@@ -928,7 +931,9 @@ export default function WorkflowPage() {
           ? "(No reply content)"
           : `Error: ${res.status} ${res.statusText}`);
 
-      // --------- Conversation id round-trip ---------
+      // --------------------------
+      // UPDATE CONVERSATION ID
+      // --------------------------
       const returnedConvId =
         data?.conversation_id || data?.conversationId || data?.conv_id;
 
@@ -943,7 +948,9 @@ export default function WorkflowPage() {
         setActiveConversationId(returnedConvId);
       }
 
-      // --------- Compact citation suffix (optional) ---------
+      // --------------------------
+      // CITATIONS (optional)
+      // --------------------------
       let citationsSuffix = "";
       if (Array.isArray(data?.citations) && data.citations.length > 0) {
         const firstThree = data.citations.slice(0, 3);
@@ -956,16 +963,32 @@ export default function WorkflowPage() {
       }
 
       // ======================================================
-      //  DYNAMIC ZUORA PAYLOAD STEPS (NO HARDCODED 3 STEPS)
+      //  HANDLE DYNAMIC ZUORA API PAYLOADS FROM LLM
       // ======================================================
       if (
         Array.isArray(data?.zuora_api_payloads) &&
         data.zuora_api_payloads.length > 0
       ) {
-        setPersistedZuoraPayloads(data.zuora_api_payloads);
-
         const items = data.zuora_api_payloads as ZuoraPayloadItem[];
 
+        // Normalize types from LLM
+        const normalizeType = (t: string) => {
+          if (!t) return "step";
+          const map: Record<string, string> = {
+            product_create: "product",
+            product: "product",
+
+            rate_plan_create: "rateplan",
+            rateplan: "rateplan",
+
+            charge_create: "rateplancharge",
+            rateplancharge: "rateplancharge",
+            rate_plan_charge: "rateplancharge",
+          };
+          return map[t] || t;
+        };
+
+        // TITLE / DESC
         const makeTitle = (t: string, i: number) => {
           switch (t) {
             case "product":
@@ -975,7 +998,7 @@ export default function WorkflowPage() {
             case "rateplancharge":
               return `Step ${i} — Create Rate Plan Charge`;
             default:
-              return `Step ${i} — ${t || "Zuora Call"}`;
+              return `Step ${i} — ${t}`;
           }
         };
 
@@ -984,52 +1007,56 @@ export default function WorkflowPage() {
             case "product":
               return "Zuora call to create the Product object.";
             case "rateplan":
-              return "Zuora call to create a Product Rate Plan for the product.";
+              return "Zuora call to create a Product Rate Plan.";
             case "rateplancharge":
-              return "Zuora call to create a Rate Plan Charge under the rate plan.";
+              return "Zuora call to create the Rate Plan Charge.";
             default:
               return "";
           }
         };
 
-        const newSteps: ZuoraStep[] = items.map((item, index) => ({
-          id: `${Date.now()}-${index}`,
-          type: item.zuora_api_type || "step",
-          title: makeTitle(item.zuora_api_type || "step", index + 1),
-          description: makeDescription(item.zuora_api_type || "step"),
-          json: JSON.stringify(item.payload ?? {}, null, 2),
-          error: null,
-          expanded: true,
-        }));
+        // -----------------------------
+        // BUILD STEPS (for UI editor)
+        // -----------------------------
+        const newSteps: ZuoraStep[] = items.map((item, index) => {
+          const normalizedType = normalizeType(item.zuora_api_type);
 
-        // Store for the dynamic preview cards
+          return {
+            id: `${Date.now()}-${index}`,
+            type: normalizedType,
+            title: makeTitle(normalizedType, index + 1),
+            description: makeDescription(normalizedType),
+            json: JSON.stringify(item.payload ?? {}, null, 2),
+            error: null,
+            expanded: true,
+          };
+        });
+
         setZuoraSteps(newSteps);
         setShowPayload(true);
 
-        // Optional: keep first product / rateplan / charge in legacy preparedPayloads
-        const firstProduct =
-          items.find((x) => x.zuora_api_type === "product")?.payload ?? null;
-        const firstRatePlan =
-          items.find((x) => x.zuora_api_type === "rateplan")?.payload ?? null;
-        const firstCharge =
-          items.find((x) => x.zuora_api_type === "rateplancharge")?.payload ??
-          null;
-
-        setPreparedPayloads({
-          step1: firstProduct,
-          step2: firstRatePlan,
-          step3: firstCharge,
-        });
+        // -----------------------------
+        // SAVE PAYLOAD PER CONVERSATION
+        // -----------------------------
+        setConversationPayloads((prev) => ({
+          ...prev,
+          [safeConvId]: items.map((item) => ({
+            ...item,
+            zuora_api_type: normalizeType(item.zuora_api_type),
+          })),
+        }));
 
         addAssistantMessage(
           `I generated ${newSteps.length} Zuora API payload step${
             newSteps.length > 1 ? "s" : ""
-          }. You can review and edit them in the workspace preview.`,
-          200
+          }. You can review and edit them in the workspace.`,
+          150
         );
       }
 
-      // --------- Append assistant reply to chat ---------
+      // --------------------------
+      // APPEND REPLY TO CHAT
+      // --------------------------
       setChatMessages((prev) => [
         ...prev,
         {
@@ -1044,7 +1071,7 @@ export default function WorkflowPage() {
         {
           role: "assistant",
           content:
-            "Sorry, I couldn't reach the chat service. Please try again in a moment.",
+            "Sorry, I couldn't reach the chat service. Please try again shortly.",
           timestamp: new Date(),
         },
       ]);
@@ -1865,10 +1892,9 @@ export default function WorkflowPage() {
   const handleExecute = async () => {
     if (!clientId || !clientSecret) {
       setToastMessage({
-        message: "Client ID/Secret required to create product",
+        message: "Client ID and Client Secret are required",
         type: "error",
       });
-
       addAssistantMessage("Please enter Client ID and Client Secret.");
       return;
     }
@@ -1882,9 +1908,9 @@ export default function WorkflowPage() {
       let ratePlanPayload: any = null;
       let ratePlanChargePayload: any = null;
 
-      // ───────────────────────────────────────────────
-      // 1) DYNAMIC MODE – use zuoraSteps (zuora_api_payloads)
-      // ───────────────────────────────────────────────
+      // ===========================================================
+      // 1️⃣ DYNAMIC MODE — USE EDITED PAYLOADS FROM WORKSPACE STEPS
+      // ===========================================================
       if (zuoraSteps.length > 0) {
         const updatedSteps = zuoraSteps.map((s) => ({ ...s }));
         const parsedSteps: { type: string; payload: any }[] = [];
@@ -1901,8 +1927,8 @@ export default function WorkflowPage() {
             const parsed = JSON.parse(step.json);
             step.error = null;
             parsedSteps.push({ type: step.type, payload: parsed });
-          } catch (e: any) {
-            step.error = e?.message || "Invalid JSON";
+          } catch (err: any) {
+            step.error = err.message || "Invalid JSON";
             hasError = true;
           }
         });
@@ -1911,28 +1937,35 @@ export default function WorkflowPage() {
 
         if (hasError) {
           throw new Error(
-            "One or more steps contain invalid JSON. Please fix them and try again."
+            "One or more steps contain invalid JSON. Fix them before executing."
           );
         }
 
-        // Map by type → product / rateplan / rateplancharge
         productPayload =
           parsedSteps.find((s) => s.type === "product")?.payload || null;
         ratePlanPayload =
           parsedSteps.find((s) => s.type === "rateplan")?.payload || null;
-        ratePlanChargePayload =
-          parsedSteps.find((s) => s.type === "rateplancharge")?.payload || null;
+       
 
-        // Keep for debugging / future reuse
+          const chargePayloads = parsedSteps
+  .filter((s) => s.type === "rateplancharge")
+  .map((s) => s.payload);
+
+ratePlanChargePayload = chargePayloads.length > 0 ? chargePayloads : null;
+
+
+        // Save what user last edited
         setPreparedPayloads({
           step1: productPayload,
           step2: ratePlanPayload,
           step3: ratePlanChargePayload,
         });
-      } else {
-        // ───────────────────────────────────────────────
-        // 2) FALLBACK MODE – old 3-step textareas
-        // ───────────────────────────────────────────────
+      }
+
+      // ===========================================================
+      // 2️⃣ FALLBACK MODE — OLD TEXTAREA FIELDS
+      // ===========================================================
+      else {
         let step1Obj: any = null;
         let step2Obj: any = null;
         let step3Obj: any = null;
@@ -1979,7 +2012,18 @@ export default function WorkflowPage() {
         });
       }
 
-      // 3) FINAL PAYLOAD → Lambda
+      // ===========================================================
+      // 3️⃣ VALIDATE REQUIRED PAYLOAD (product is mandatory)
+      // ===========================================================
+      if (!productPayload) {
+        throw new Error(
+          "No product payload found. Please review the steps before executing."
+        );
+      }
+
+      // ===========================================================
+      // 4️⃣ FINAL PAYLOAD SENT TO LAMBDA
+      // ===========================================================
       const payload = {
         clientId,
         clientSecret,
@@ -1990,9 +2034,12 @@ export default function WorkflowPage() {
         },
       };
 
-      console.log("🔥 FINAL PAYLOAD SENT TO ZUORA LAMBDA:");
+      console.log("🔥 FINAL PAYLOAD SENT TO ZUORA LAMBDA →");
       console.log(JSON.stringify(payload, null, 2));
 
+      // ===========================================================
+      // 5️⃣ CALL LAMBDA
+      // ===========================================================
       const res = await fetch(
         "https://7ajwemkf19.execute-api.us-east-2.amazonaws.com/demo/zuora/product",
         {
@@ -2007,79 +2054,160 @@ export default function WorkflowPage() {
       try {
         data = JSON.parse(raw);
       } catch {
-        /* ignore */
+        throw new Error("Invalid JSON response from Lambda.");
       }
 
-      // =====================================
-      // ✅ SUCCESS → STATUS 200 OR 201
-      // =====================================
-      if (res.status === 200 || res.status === 201) {
+      console.log("🔍 LAMBDA RESPONSE:", data);
+
+      // ===========================================================
+      // 6️⃣ REAL ERROR CHECKING (IMPORTANT!)
+      // ===========================================================
+      const isFailure =
+        data.error ||
+        data.Error ||
+        data.Errors ||
+        data.success === false ||
+        data.Success === false ||
+        res.status >= 400;
+
+      if (isFailure) {
+        const errMsg =
+          data.error ||
+          data.Error ||
+          JSON.stringify(data.Errors) ||
+          "Zuora request failed.";
+
         setToastMessage({
-          message: data.message || "Operation completed successfully!",
-          type: "success",
-        });
-      } else {
-        // =====================================
-        // ❌ FAILURE → ANY OTHER STATUS
-        // =====================================
-        setToastMessage({
-          message: data?.error || data?.message || "Operation failed!",
+          message: errMsg,
           type: "error",
         });
 
-        throw new Error(
-          data?.error || data?.message || `Failed with status ${res.status}`
-        );
+        addAssistantMessage(`❌ ${errMsg}`);
+        throw new Error(errMsg);
       }
 
-      // =====================================
-      // 🔄 Continue mapping IDs after status check
-      // =====================================
-      const productId: string | undefined =
-        data.productId || data.Id || data.id;
+      // ===========================================================
+      // 7️⃣ SUCCESS HANDLING
+      // ===========================================================
+      const successMessage =
+        data.message || "Product + RatePlan + Charges created!";
 
-      const ratePlanIds: string[] = [];
-      if (Array.isArray(data.ratePlans)) {
-        ratePlanIds.push(
-          ...data.ratePlans
-            .map((rp: any) => rp.Id || rp.id || rp.ratePlanId)
-            .filter(Boolean)
-        );
-      }
-      if (data.ratePlanId) ratePlanIds.push(data.ratePlanId);
-
-      const chargeIds: string[] = [];
-      if (Array.isArray(data.charges)) {
-        chargeIds.push(
-          ...data.charges
-            .map((ch: any) => ch.Id || ch.id || ch.ratePlanChargeId)
-            .filter(Boolean)
-        );
-      }
-      if (data.ratePlanChargeId) chargeIds.push(data.ratePlanChargeId);
-
-      // Save results
-      setExecutionResult({
-        productId: productId ?? "",
-        ratePlanIds,
-        chargeIds,
+      setToastMessage({
+        message: successMessage,
+        type: "success",
       });
 
-      // Build assistant success message
-      let msg =
-        data.message ||
-        "✅ Product + RatePlans + Charges created successfully!";
+      addAssistantMessage(`✅ ${successMessage}`);
 
-      if (productId) msg += `\n\nProduct Id: ${productId}`;
-      if (ratePlanIds.length)
-        msg += `\nRatePlan Ids:\n- ${ratePlanIds.join("\n- ")}`;
-      if (chargeIds.length) msg += `\nCharge Ids:\n- ${chargeIds.join("\n- ")}`;
+      setExecutionResult({
+        productId: data.productId,
+        ratePlanIds: data.ratePlanIds || [],
+        chargeIds: data.chargeIds || [],
+      });
 
-      addAssistantMessage(msg,200);
+      // setShowPayload(false);
+    } catch (err: any) {
+      // console.error("❌ EXECUTION ERROR:", err.message || err);
 
+      setToastMessage({
+        message: err.message || "Execution failed",
+        type: "error",
+      });
     } finally {
       setExecuting(false);
     }
+  };
+
+
+  const handleRefreshConversation = () => {
+    // 1️⃣ Create a brand-new conversation ID
+    const freshId = newConversationId();
+
+    // 2️⃣ Save to React state
+    setConversationId(freshId);
+    setActiveConversationId(freshId);
+
+    // 3️⃣ Save to sessionStorage (PERSONA-scoped)
+    if (typeof window !== "undefined") {
+      const key = storageKeyForPersona(CHAT_PERSONA);
+      sessionStorage.setItem(key, freshId);
+    }
+
+    // 4️⃣ Insert empty conversation into left sidebar
+    const nowIso = new Date().toISOString();
+    setConversations((prev) => [
+      {
+        id: freshId,
+        title: "New chat",
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      },
+      ...prev,
+    ]);
+
+    // 5️⃣ Reset chat messages to default
+    setChatMessages([
+      {
+        role: "assistant",
+        content:
+          "Hi, I'm Zia — your AI configuration assistant. Let's connect to Zuora and manage your Product Catalog.",
+        timestamp: new Date(),
+      },
+    ]);
+
+    // 6️⃣ Reset all workspace flows
+    setCurrentFlow("idle");
+    setCreateProductStep("name");
+    setUpdateProductStep("identify");
+    setExpireProductStep("identify");
+    setViewProductStep("choose-scope");
+
+    // Reset product data
+    setProductData({
+      name: "",
+      sku: "",
+      description: "",
+      startDate: "",
+      ratePlans: [],
+    });
+    setCurrentRatePlan({ name: "", description: "", charges: [] });
+    setSelectedProduct(null);
+    setSelectedAttribute("");
+    setNewAttributeValue("");
+    setExpireMethod("");
+    setExpireDate("");
+    setViewScope("specific");
+    setViewDetailType("");
+
+    // Reset UI payload workspace
+    setZuoraSteps([]);
+    setShowPayload(false);
+    setPreparedPayloads({ step1: null, step2: null, step3: null });
+    setExecutionResult(null);
+
+    // 7️⃣ DO NOT REMOVE conversation-specific Zuora payloads
+    // (you already removed this, so nothing here)
+
+    setToastMessage({
+      type: "success",
+      message: "Conversation reset — new chat started.",
+    });
+  };
+
+
+
+
+  const resetZuoraApiPayloadForChat = (convId: string) => {
+    setConversationPayloads((prev) => {
+      const updated = { ...prev };
+      delete updated[convId]; // Remove payloads for THIS chat only
+      return updated;
+    });
+
+    // Also remove from localStorage (if you persist it)
+    const saved = JSON.parse(localStorage.getItem("pm_chat_payloads") || "{}");
+    delete saved[convId];
+    localStorage.setItem("pm_chat_payloads", JSON.stringify(saved));
   };
 
   const generateProductPayload = () => {
@@ -2303,7 +2431,7 @@ export default function WorkflowPage() {
 
         {/* Left Panel - Chat Assistant */}
         <div
-          className="flex w-[38%] flex-col border-r border-gray-200
+          className="flex w-[36%] flex-col border-r border-gray-200
                   bg-gradient-to-b from-[#F9FAFB] to-white min-h-0"
           style={{ height: "87vh" }}
         >
@@ -2319,23 +2447,14 @@ export default function WorkflowPage() {
                 variant="ghost"
                 size="sm"
                 className="text-gray-600 hover:text-gray-900"
-                onClick={() => {
-                  setChatMessages([
-                    {
-                      role: "assistant",
-                      content:
-                        "Hi, I'm Zia — your AI configuration assistant. Let's connect to Zuora and manage your Product Catalog.",
-                      timestamp: new Date(),
-                    },
-                  ]);
-                  setCurrentFlow("idle");
-                  setCompletedFlows([]);
-                  setShowPayload(false); // 👈 hide preview panel
-                  setZuoraSteps([]); // 👈 clear dynamic steps
-                  setExecutionResult(null); // 👈 hides product link button as well
-                }}
+
+                onClick={handleRefreshConversation}
+
               >
-                <RotateCcw className="h-4 w-4" />
+                <RotateCcw
+
+                  className="h-4 w-4 cursor-pointer text-gray-500 hover:text-gray-700"
+                />
               </Button>
             </div>
           </div>
@@ -2416,7 +2535,7 @@ export default function WorkflowPage() {
                         {/* ASSISTANT MESSAGE (HTML) */}
                         {!isUser && (
                           <div
-                            className="prose prose-sm max-w-full dark:prose-invert break-all"
+                            className="prose prose-sm max-w-full dark:prose-invert break-words"
                             dangerouslySetInnerHTML={{
                               __html: message.content,
                             }}
@@ -2889,7 +3008,7 @@ export default function WorkflowPage() {
 
         {/* Right Panel - Zuora Workspace */}
         <div
-          className="w-[60%] overflow-y-auto p-8"
+          className="w-[56%] overflow-y-auto p-8"
           style={{ overscrollBehavior: "contain" }}
         >
           {!isConnected ? (
@@ -3023,145 +3142,150 @@ export default function WorkflowPage() {
             </div>
           ) : (
             <div className="space-y-6">
-              {/* 3-step preview (Product, Rate Plan, Charge) */}
-              {showPayload && zuoraSteps.length > 0 && (
-                <div className="space-y-6">
-                  {zuoraSteps.map((step, index) => (
-                    <Card key={step.id}>
-                      <CardHeader
-                        onClick={() =>
-                          setZuoraSteps((prev) =>
-                            prev.map((s) =>
-                              s.id === step.id
-                                ? { ...s, expanded: !s.expanded }
-                                : s
+              {/* 🔥 PARENT SCROLL WRAPPER */}
+              <div className="max-h-[75vh] overflow-y-auto pr-2">
+                {/* 3-step preview (Product, Rate Plan, Charge) */}
+                {showPayload && zuoraSteps.length > 0 && (
+                  <div className="space-y-6">
+                    {zuoraSteps.map((step, index) => (
+                      <Card key={step.id}>
+                        <CardHeader
+                          onClick={() =>
+                            setZuoraSteps((prev) =>
+                              prev.map((s) =>
+                                s.id === step.id
+                                  ? { ...s, expanded: !s.expanded }
+                                  : s
+                              )
                             )
-                          )
-                        }
-                        className="cursor-pointer"
-                      >
-                        <div className="flex items-center justify-between">
-                          <div>
-                            <CardTitle>
-                              {step.title || `Step ${index + 1}`}
-                            </CardTitle>
-                            <CardDescription>
-                              {step.description}
-                            </CardDescription>
-                          </div>
-                          <ChevronDown
-                            className={`h-4 w-4 transition-transform ${
-                              step.expanded ? "rotate-180" : ""
-                            }`}
-                          />
-                        </div>
-                      </CardHeader>
-
-                      {step.expanded && (
-                        <CardContent>
-                          {(step.error || step.jsonError) && (
-                            <div className="mb-3 rounded-lg border border-red-400 bg-red-50 p-3 text-xs text-red-700">
-                              {step.error || step.jsonError}
+                          }
+                          className="cursor-pointer"
+                        >
+                          <div className="flex items-center justify-between">
+                            <div>
+                              <CardTitle>
+                                {step.title || `Step ${index + 1}`}
+                              </CardTitle>
+                              <CardDescription>
+                                {step.description}
+                              </CardDescription>
                             </div>
-                          )}
-
-                          <textarea
-                            className="h-56 w-full rounded-lg border bg-slate-900 p-4 font-mono text-xs text-green-400"
-                            value={step.json}
-                            onChange={(e) => {
-                              const val = e.target.value;
-                              setZuoraSteps((prev) =>
-                                prev.map((s) => {
-                                  if (s.id !== step.id) return s;
-                                  let jsonError: string | null = null;
-                                  try {
-                                    if (val.trim()) JSON.parse(val);
-                                  } catch (err: any) {
-                                    jsonError = err.message;
-                                  }
-                                  return { ...s, json: val, jsonError };
-                                })
-                              );
-                            }}
-                          />
-
-                          <div className="mt-3 flex gap-2">
-                            <Button
-                              size="sm"
-                              variant="outline"
-                              onClick={async () => {
-                                try {
-                                  setCopying(true);
-                                  await navigator.clipboard.writeText(
-                                    step.json
-                                  );
-                                  setToastMessage({
-                                    message: `Copied ${
-                                      step.title || `step ${index + 1}`
-                                    } payload`,
-                                    type: "success",
-                                  });
-                                } catch {
-                                  setToastMessage({
-                                    message:
-                                      "Copy failed. Select and copy manually.",
-                                    type: "error",
-                                  });
-                                } finally {
-                                  setCopying(false);
-                                }
-                              }}
-                            >
-                              Copy Step {index + 1}
-                            </Button>
+                            <ChevronDown
+                              className={`h-4 w-4 transition-transform ${
+                                step.expanded ? "rotate-180" : ""
+                              }`}
+                            />
                           </div>
-                        </CardContent>
-                      )}
-                    </Card>
-                  ))}
+                        </CardHeader>
 
-                  <div className="flex flex-col gap-3 pt-2">
-                    <Button
-                      className="w-full bg-green-600 hover:bg-green-700 disabled:opacity-60"
-                      onClick={handleExecute}
-                      disabled={
-                        executing || zuoraSteps.some((s) => s.jsonError)
-                      }
-                    >
-                      <CheckCircle2 className="mr-2 h-4 w-4" />
-                      {executing
-                        ? "Creating in Zuora…"
-                        : "Create product, product rate plan, rate plan charge"}
-                    </Button>
-                  </div>
-                </div>
-              )}
+                        {step.expanded && (
+                          <CardContent>
+                            {(step.error || step.jsonError) && (
+                              <div className="mb-3 rounded-lg border border-red-400 bg-red-50 p-3 text-xs text-red-700">
+                                {step.error || step.jsonError}
+                              </div>
+                            )}
 
-              {isConnected &&
-                showConnectedCard &&
-                currentFlow === "idle" &&
-                !showPayload && (
-                  <div className="mx-auto max-w-2xl">
-                    <Card className="border-green-200 bg-green-50">
-                      <CardContent className="flex items-center gap-3">
-                        <CheckCircle2 className="h-8 w-8 text-green-600" />
-                        <div>
-                          <h3 className="text-lg font-semibold text-green-900">
-                            ✅ Connected to Zuora
-                          </h3>
-                          <p className="text-sm text-green-700">
-                            Environment:{" "}
-                            {environment === "api-sandbox"
-                              ? "API Sandbox"
-                              : environment === "sandbox"
-                              ? "Sandbox / Test"
-                              : "Production"}
-                          </p>
-                        </div>
-                      </CardContent>
-                    </Card>
+                            <textarea
+                              className="h-56 w-full rounded-lg border bg-slate-900 p-4 font-mono text-xs text-green-400"
+                              value={step.json}
+                              onChange={(e) => {
+                                const val = e.target.value;
+                                setZuoraSteps((prev) =>
+                                  prev.map((s) => {
+                                    if (s.id !== step.id) return s;
+                                    let jsonError: string | null = null;
+                                    try {
+                                      if (val.trim()) JSON.parse(val);
+                                    } catch (err: any) {
+                                      jsonError = err.message;
+                                    }
+                                    return { ...s, json: val, jsonError };
+                                  })
+                                );
+                              }}
+                            />
+
+                            <div className="mt-3 flex gap-2">
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                onClick={async () => {
+                                  try {
+                                    setCopying(true);
+                                    await navigator.clipboard.writeText(
+                                      step.json
+                                    );
+
+                                    setToastMessage({
+                                      message: `Copied ${
+                                        step.title || `step ${index + 1}`
+                                      } payload`,
+                                      type: "success",
+                                    });
+                                  } catch {
+                                    setToastMessage({
+                                      message:
+                                        "Copy failed. Select and copy manually.",
+                                      type: "error",
+                                    });
+                                  } finally {
+                                    setCopying(false);
+                                  }
+                                }}
+                              >
+                                Copy Step {index + 1}
+                              </Button>
+                            </div>
+                          </CardContent>
+                        )}
+                      </Card>
+                    ))}
+
+                    {/* Button stays AFTER scroll area */}
+                    <div className="flex flex-col gap-3 pt-2">
+                      <Button
+                        className="w-full bg-green-600 hover:bg-green-700 disabled:opacity-60"
+                        onClick={handleExecute}
+                        disabled={
+                          executing || zuoraSteps.some((s) => s.jsonError)
+                        }
+                      >
+                        <CheckCircle2 className="mr-2 h-4 w-4" />
+                        {executing
+                          ? "Creating in Zuora…"
+                          : "Create product, product rate plan, rate plan charge"}
+                      </Button>
+                    </div>
                   </div>
                 )}
+
+                {isConnected &&
+                  showConnectedCard &&
+                  currentFlow === "idle" &&
+                  !showPayload && (
+                    <div className="mx-auto max-w-2xl">
+                      <Card className="border-green-200 bg-green-50">
+                        <CardContent className="flex items-center gap-3">
+                          <CheckCircle2 className="h-8 w-8 text-green-600" />
+                          <div>
+                            <h3 className="text-lg font-semibold text-green-900">
+                              ✅ Connected to Zuora
+                            </h3>
+                            <p className="text-sm text-green-700">
+                              Environment:{" "}
+                              {environment === "api-sandbox"
+                                ? "API Sandbox"
+                                : environment === "sandbox"
+                                ? "Sandbox / Test"
+                                : "Production"}
+                            </p>
+                          </div>
+                        </CardContent>
+                      </Card>
+                    </div>
+                  )}
+              </div>
             </div>
           )}
         </div>
