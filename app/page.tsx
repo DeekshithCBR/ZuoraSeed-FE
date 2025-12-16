@@ -92,7 +92,7 @@ export default function WelcomePage() {
           <div className="flex items-center gap-3">
             <div className="text-xl font-bold text-white">Zuora Seed</div>
             <span className="rounded bg-cyan-500 px-2 py-0.5 text-xs font-semibold text-white">
-              v1
+              v0
             </span>
           </div>
 

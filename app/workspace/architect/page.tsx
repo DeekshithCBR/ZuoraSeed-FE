@@ -1,10 +1,12 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useMemo } from "react";
 import { useRouter } from "next/navigation";
 
 import Link from "next/link";
 import { Button } from "@/components/ui/button";
+import { Textarea } from "@/components/ui/textarea";
+
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -15,13 +17,6 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
 import {
   Home,
   Bell,
@@ -45,8 +40,15 @@ import {
   AlertTriangle,
   MessageSquare,
   Plus,
+  Trash2, // ⬅️ add this
 } from "lucide-react";
-// import { he } from "date-fns/locale"; // (unused)
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
 
 type ConversationFlow =
   | "idle"
@@ -112,6 +114,17 @@ interface ChargeData {
   name: string;
   fields: Record<string, string>;
 }
+interface ZuoraStep {
+  id: string;
+  type: string; // e.g. "product", "rateplan", "rateplancharge"
+  title: string; // UI title (derived from type)
+  description: string; // UI description
+  json: string; // JSON string shown in the textarea (sanitized)
+  error?: string | null; // backend/LLM error, if any
+  jsonError?: string | null; // local JSON parse error when editing
+  expanded: boolean; // for collapsible cards
+  hiddenFields?: Record<string, any>; // 🔴 dynamic refs like ProductId, etc.
+}
 
 interface RatePlanData {
   name: string;
@@ -121,6 +134,7 @@ interface RatePlanData {
 type ZuoraPayloadItem = {
   zuora_api_type: string;
   payload: any;
+  payload_id?: string; // ✅ add this
 };
 
 interface ProductData {
@@ -135,6 +149,8 @@ interface ChatMessage {
   role: "assistant" | "user";
   content: string;
   timestamp: Date;
+  // true when this assistant message is a direct reply from the LLM chat API
+  fromApi?: boolean;
 }
 
 interface CompletedFlow {
@@ -153,7 +169,6 @@ interface ValidationResult {
   message: string;
 }
 
-// Add types near top of file
 type EnvKey = "api-sandbox" | "sandbox" | "production";
 
 interface StoredConversationSummary {
@@ -165,6 +180,7 @@ interface StoredConversationSummary {
 
 const CHAT_CONVERSATIONS_KEY = "pm_chat_conversations_v1";
 const CHAT_MESSAGES_KEY_PREFIX = "pm_chat_messages_v1";
+const CHAT_ZUORA_PAYLOADS_KEY = "pm_chat_zuora_payloads_v1";
 
 const deriveTitleFromMessages = (messages: ChatMessage[]): string => {
   if (!messages || messages.length === 0) return "New chat";
@@ -179,7 +195,6 @@ const deriveTitleFromMessages = (messages: ChatMessage[]): string => {
 
   return base.length > 40 ? `${base.slice(0, 40)}…` : base;
 };
-
 
 function TypingIndicator() {
   return (
@@ -200,18 +215,27 @@ function TypingIndicator() {
   );
 }
 
-function Toast({ message, onClose }: { message: string; onClose: () => void }) {
+function Toast({
+  message,
+  type,
+  onClose,
+}: {
+  message: string;
+  type: "success" | "error";
+  onClose: () => void;
+}) {
   useEffect(() => {
     const timer = setTimeout(onClose, 3000);
     return () => clearTimeout(timer);
   }, [onClose]);
 
   return (
-    <div className="fixed bottom-24 right-8 z-50 rounded-lg bg-green-600 px-6 py-3 text-white shadow-lg">
-      <div className="flex items-center gap-2">
-        <CheckCircle2 className="h-5 w-5" />
-        <span className="font-medium">{message}</span>
-      </div>
+    <div
+      className={`fixed bottom-8 right-6 z-50 px-5 py-3 rounded-lg shadow-lg text-white font-medium transition-all ${
+        type === "error" ? "bg-red-600" : "bg-green-600"
+      }`}
+    >
+      {message}
     </div>
   );
 }
@@ -221,72 +245,194 @@ interface ChatHistorySidebarProps {
   activeConversationId: string | null;
   onNewConversation: () => void;
   onSelectConversation: (id: string) => void;
-}
+  onDeleteConversation: (id: string) => void;
+  onStartAction: (action: Exclude<ConversationFlow, "idle">) => void;
 
+  // 🆕
+  sortOrder: "asc" | "desc";
+  onToggleSort: () => void;
+}
 function ChatHistorySidebar({
   conversations,
   activeConversationId,
   onNewConversation,
   onSelectConversation,
+  onDeleteConversation,
+  onStartAction,
+  sortOrder,       // ✅ ADD
+  onToggleSort,    // ✅ ADD
 }: ChatHistorySidebarProps) {
+
   return (
-    <aside className="hidden w-64 flex-col border-r border-gray-200 bg-white/80 p-3 md:flex">
-      <div className="mb-3 flex items-center justify-between">
-        <span className="text-xs font-semibold uppercase tracking-wide text-gray-500">
-          Conversations
-        </span>
-        <Button
-          size="icon"
-          variant="outline"
-          className="h-7 w-7 border-gray-300"
-          onClick={onNewConversation}
-        >
-          <Plus className="h-4 w-4" />
-        </Button>
+    <aside className="hidden w-64 pt-[80px] flex-col border-r border-gray-200 bg-white/80 p-3 md:flex">
+      {/* CHAT HISTORY - 40% HEIGHT */}
+      <div className="flex flex-col h-[40vh]">
+        <div className="mb-3 flex items-center justify-between gap-2">
+          <span className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+            Conversations
+          </span>
+
+          <div className="flex items-center gap-1">
+            {/* SORT BUTTON */}
+            <Button
+              size="icon"
+              variant="outline"
+              className="h-7 w-7 border-gray-300"
+              title={
+                sortOrder === "desc"
+                  ? "Sorted: Newest first"
+                  : "Sorted: Oldest first"
+              }
+              onClick={onToggleSort}
+            >
+              <ChevronDown
+                className={`h-4 w-4 transition-transform ${
+                  sortOrder === "asc" ? "rotate-180" : ""
+                }`}
+              />
+            </Button>
+
+            {/* ADD CONVERSATION */}
+            <Button
+              size="icon"
+              variant="outline"
+              className="h-7 w-7 border-gray-300"
+              onClick={onNewConversation}
+            >
+              <Plus className="h-4 w-4" />
+            </Button>
+          </div>
+        </div>
+
+        <div className="flex-1 overflow-y-auto space-y-1 pr-1">
+          {conversations.length === 0 && (
+            <p className="text-xs text-gray-500">
+              Start a new chat to see it here.
+            </p>
+          )}
+
+          {conversations.map((conv) => (
+            <button
+              key={conv.id}
+              type="button"
+              onClick={() => onSelectConversation(conv.id)}
+              className={`flex w-full items-center justify-between rounded-md px-2 py-2 text-left text-xs transition ${
+                conv.id === activeConversationId
+                  ? "bg-slate-900 text-white"
+                  : "bg-transparent text-gray-800 hover:bg-gray-100"
+              }`}
+            >
+              <div className="flex min-w-0 flex-1 items-center gap-2">
+                <div className="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-md border border-gray-200 bg-white">
+                  <MessageSquare className="h-3.5 w-3.5" />
+                </div>
+                <div className="flex min-w-0 flex-1 flex-col">
+                  <span className="truncate font-medium">
+                    {conv.title || "New chat"}
+                  </span>
+                  <span className="truncate text-[10px] text-gray-500">
+                    {new Date(conv.updatedAt).toLocaleString(undefined, {
+                      month: "short",
+                      day: "numeric",
+                      hour: "2-digit",
+                      minute: "2-digit",
+                    })}
+                  </span>
+                </div>
+              </div>
+
+              <div
+                role="button"
+                tabIndex={0}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onDeleteConversation(conv.id);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.stopPropagation();
+                    onDeleteConversation(conv.id);
+                  }
+                }}
+                className="ml-1 inline-flex h-5 w-5 items-center justify-center rounded hover:bg-slate-900/10 cursor-pointer"
+              >
+                <Trash2 className="h-3 w-3" />
+              </div>
+            </button>
+          ))}
+        </div>
       </div>
-      <div className="flex-1 space-y-1 overflow-y-auto pr-1">
-        {conversations.length === 0 && (
-          <p className="text-xs text-gray-500">
-            Start a new chat to see it here.
-          </p>
-        )}
-        {conversations.map((conv) => (
-          <button
-            key={conv.id}
-            type="button"
-            onClick={() => onSelectConversation(conv.id)}
-            className={`flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-xs transition ${
-              conv.id === activeConversationId
-                ? "bg-slate-900 text-white"
-                : "bg-transparent text-gray-800 hover:bg-gray-100"
-            }`}
+
+      {/* SUGGESTED ACTIONS - 30% HEIGHT */}
+      {/* <div className="h-[30vh] mt-4 overflow-y-auto">
+        <p className="mb-3 text-sm font-medium text-gray-700">
+          Suggested Actions
+        </p>
+
+        <div className="space-y-2">
+          <Button
+            variant="outline"
+            className="w-full justify-start gap-2 border-gray-200 bg-white hover:border-[#2B6CF3] hover:bg-blue-50"
+            onClick={() => onStartAction("create-product")}
           >
-            <div className="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-md border border-gray-200 bg-white">
-              <MessageSquare className="h-3.5 w-3.5" />
-            </div>
-            <div className="flex min-w-0 flex-1 flex-col">
-              <span className="truncate font-medium">
-                {conv.title || "New chat"}
-              </span>
-              <span className="truncate text-[10px] text-gray-500">
-                {new Date(conv.updatedAt).toLocaleString(undefined, {
-                  month: "short",
-                  day: "numeric",
-                })}
-              </span>
-            </div>
-          </button>
-        ))}
-      </div>
+            <Package className="h-4 w-4 text-[#2B6CF3]" />
+            <span className="text-sm">Create Product</span>
+          </Button>
+
+          <Button
+            variant="outline"
+            className="w-full justify-start gap-2 border-gray-200 bg-white hover:border-[#2B6CF3] hover:bg-blue-50"
+            onClick={() => onStartAction("update-product")}
+          >
+            <Edit className="h-4 w-4 text-[#2B6CF3]" />
+            <span className="text-sm">Update Product</span>
+          </Button>
+
+          <Button
+            variant="outline"
+            className="w-full justify-start gap-2 border-gray-200 bg-white hover:border-[#2B6CF3] hover:bg-blue-50"
+            onClick={() => onStartAction("expire-product")}
+          >
+            <Clock className="h-4 w-4 text-[#2B6CF3]" />
+            <span className="text-sm">Expire Product</span>
+          </Button>
+
+          <Button
+            variant="outline"
+            className="w-full justify-start gap-2 border-gray-200 bg-white hover:border-[#2B6CF3] hover:bg-blue-50"
+            onClick={() => onStartAction("view-product")}
+          >
+            <Eye className="h-4 w-4 text-[#2B6CF3]" />
+            <span className="text-sm">View Product</span>
+          </Button>
+        </div>
+      </div> */}
+
+      {/* EMPTY SPACE - 30% HEIGHT */}
+      <div className="h-[10vh]"></div>
     </aside>
   );
 }
 
+// ---- Helper to map zuora_api_payloads → individual step payloads ----
+const mapZuoraApiPayloadsToSteps = (apiResponse: {
+  zuora_api_payloads?: ZuoraPayloadItem[];
+}) => {};
+
 export default function WorkflowPage() {
   const [isConnected, setIsConnected] = useState(false);
-  const [zuoraGeneratedBody, setZuoraGeneratedBody] = useState(null);
   const [showConnectedCard, setShowConnectedCard] = useState(false);
+  const [zuoraSteps, setZuoraSteps] = useState<ZuoraStep[]>([]);
+  const [conversationPayloads, setConversationPayloads] = useState<{
+    [convId: string]: ZuoraPayloadItem[];
+  }>({});
 
+  const hydrationDidRun = { current: false };
+
+  // Stores the array [{ zuora_api_type, payload }]
+  const [persistedZuoraPayloads, setPersistedZuoraPayloads] = useState<
+    ZuoraPayloadItem[]
+  >([]);
   const [environment, setEnvironment] = useState("");
   const [clientId, setClientId] = useState("");
   const [clientSecret, setClientSecret] = useState("");
@@ -304,6 +450,193 @@ export default function WorkflowPage() {
     startDate: "",
     ratePlans: [],
   });
+
+  /**
+   * Reverse normalize internal zuora_api_type to LLM original formats.
+   */
+  const revertZuoraApiType = (t: string): string => {
+    const map: Record<string, string> = {
+      product: "product_create",
+      rateplan: "rate_plan_create",
+      rateplancharge: "charge_create",
+    };
+    return map[t] || t;
+  };
+
+  /**
+   * Take internal payload array and convert back to LLM-style payloads.
+   */
+  const revertZuoraApiPayloads = (items: ZuoraPayloadItem[]) => {
+    if (!Array.isArray(items)) return [];
+
+    return items.map((i) => ({
+      zuora_api_type: revertZuoraApiType(i.zuora_api_type),
+      payload: i.payload,
+      payload_id: i.payload_id, // ✅ keep it
+    }));
+  };
+  const buildZuoraStepsFromPayloads = (
+    convId: string,
+    items: ZuoraPayloadItem[]
+  ): ZuoraStep[] => {
+    if (!items || items.length === 0) return [];
+
+    // 🔍 detect REST-style payloads: payload has method + endpoint
+    const hasDirectRestPayloads = items.some(
+      (item) =>
+        item &&
+        item.payload &&
+        typeof item.payload === "object" &&
+        "method" in item.payload &&
+        "endpoint" in item.payload
+    );
+
+    const normalizeType = (t: string) => {
+      if (!t) return "step";
+      const map: Record<string, string> = {
+        product_create: "product",
+        product: "product",
+
+        rate_plan_create: "rateplan",
+        rateplan: "rateplan",
+
+        charge_create: "rateplancharge",
+        rateplancharge: "rateplancharge",
+      };
+
+      if (map[t]) return map[t];
+
+      if (t.endsWith("_create")) {
+        const base = t.replace(/_create$/, "");
+        if (base === "product") return "product";
+        if (base === "rate_plan" || base === "rateplan") return "rateplan";
+        if (base === "charge" || base === "rateplancharge")
+          return "rateplancharge";
+        return base;
+      }
+
+      return t;
+    };
+
+    const makeDescription = (t: string) => {
+      switch (t) {
+        case "product":
+          return "Zuora call to create the Product.";
+        case "rateplan":
+          return "Zuora call to create a Product Rate Plan.";
+        case "rateplancharge":
+          return "Zuora call to create the Rate Plan Charge.";
+        default:
+          if (t.endsWith("_update")) {
+            return "Zuora call to update an existing Product.";
+          }
+          if (t.includes("expire")) {
+            return "Zuora call to expire an Product.";
+          }
+          return "";
+      }
+    };
+
+    return items.map((item, index) => {
+      const normalizedType = hasDirectRestPayloads
+        ? item.zuora_api_type
+        : normalizeType(item.zuora_api_type);
+
+      const { display, hidden } = sanitizePayloadForDisplay(item.payload ?? {});
+
+      const title =
+        normalizedType === "product"
+          ? "Create Product"
+          : normalizedType === "rateplan"
+          ? "Create Rate Plan"
+          : normalizedType === "rateplancharge"
+          ? "Create Rate Plan Charge"
+          : `Step ${index + 1}`;
+
+      return {
+        id: `${convId}-step-${index + 1}`,
+        type: normalizedType as any,
+        title:
+          item.payload.name ||
+          item.payload.Name ||
+          item.payload.body.Name ||
+          item.payload.body.Description,
+        description: makeDescription(normalizedType),
+        json: JSON.stringify(display, null, 2),
+        parsedPayload: item.payload ?? {},
+        payload_id: item.payload_id,
+        expanded: true,
+        error: null,
+        jsonError: null,
+        hiddenFields: hidden,
+      };
+    });
+  };
+
+  // helper to strip dynamic refs from the preview JSON
+  const sanitizePayloadForDisplay = (payload: any) => {
+    if (!payload || typeof payload !== "object") {
+      return { display: payload, hidden: {} as Record<string, any> };
+    }
+
+    const clone: any = Array.isArray(payload) ? [...payload] : { ...payload };
+    const hidden: Record<string, any> = {};
+
+    const DYNAMIC_KEYS = ["ProductId", "ProductRatePlanId", "RatePlanId"];
+
+    for (const key of Object.keys(clone)) {
+      const val = clone[key];
+      if (
+        typeof val === "string" &&
+        val.startsWith("@{") &&
+        DYNAMIC_KEYS.includes(key)
+      ) {
+        // store raw dynamic value
+        hidden[key] = val;
+        // either remove it or show a nicer hint
+        // Option A: completely hide from JSON
+        delete clone[key];
+
+        // Option B (alternative): show a placeholder instead
+        // clone[key] = "<auto-linked from previous step>";
+      } else if (val && typeof val === "object") {
+        // optional: recurse into nested objects if needed
+      }
+    }
+
+    return { display: clone, hidden };
+  };
+
+  const handleDeleteConversation = (id: string) => {
+    if (typeof window !== "undefined") {
+      const confirmed = window.confirm(
+        "Delete this chat? This action cannot be undone."
+      );
+      if (!confirmed) return;
+    }
+
+    const remaining = conversations.filter((c) => c.id !== id);
+    setConversations(remaining);
+
+    // remove stored messages
+    try {
+      if (typeof window !== "undefined") {
+        localStorage.removeItem(`${CHAT_MESSAGES_KEY_PREFIX}:${id}`);
+      }
+    } catch {
+      // ignore
+    }
+
+    // if we deleted the active chat, move to another or create fresh
+    if (activeConversationId === id) {
+      if (remaining.length > 0) {
+        const next = remaining[0];
+        handleSelectConversation(next.id);
+      } else {
+        handleNewConversation();
+      }
+    }
+  };
 
   const [currentRatePlan, setCurrentRatePlan] = useState<RatePlanData>({
     name: "",
@@ -344,20 +677,83 @@ export default function WorkflowPage() {
     chargeIds: string[];
   } | null>(null);
   const router = useRouter();
+  const productConsoleLink = executionResult?.productId
+    ? getZuoraProductUrl(environment, executionResult.productId)
+    : null;
+
+  function getZuoraProductUrl(env: string, productId?: string | null) {
+    if (!productId) return null;
+
+    switch (env) {
+      case "api-sandbox":
+        return `https://apisandbox.zuora.com/apps/Product.do?method=view&id=${productId}`;
+      case "sandbox":
+        return `https://sandbox.zuora.com/apps/Product.do?method=view&id=${productId}`;
+      case "production":
+        return `https://www.zuora.com/apps/Product.do?method=view&id=${productId}`;
+      default:
+        return null;
+    }
+  }
+
+  const handleHomeClick = () => {
+    if (isConnected) {
+      const confirmLeave = window.confirm(
+        "Zuora connection will be disconnected. Do you want to proceed?"
+      );
+
+      if (!confirmLeave) return;
+
+      // clear connection state before leaving
+      setIsConnected(false);
+      setTokenInfo(null);
+      router.push("/");
+    } else {
+      // clear connection state before leaving
+      setIsConnected(false);
+      setTokenInfo(null);
+      router.push("/");
+    }
+  };
 
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
     {
       role: "assistant",
       content:
-        "Hi, I'm Zia — your AI configuration assistant. Let's connect to Zuora and manage your Product Catalog.",
+        "Hi, I'm Zia — your AI  Architect. Let's connect to Zuora and manage your Product Catalog.",
       timestamp: new Date(),
     },
   ]);
   const [chatInput, setChatInput] = useState("");
-  const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [toastMessage, setToastMessage] = useState<{
+    message: string;
+    type: "success" | "error";
+  } | null>(null);
+
+  // ---- Multi-step preview state ----
   const [showPayload, setShowPayload] = useState(false);
-  const [apiPayloadText, setApiPayloadText] = useState<string | null>(null);
-  const [isPayloadExpanded, setIsPayloadExpanded] = useState(true);
+
+  const [expandStep1, setExpandStep1] = useState(true);
+  const [expandStep2, setExpandStep2] = useState(true);
+  const [expandStep3, setExpandStep3] = useState(true);
+
+  const [step1ProductJson, setStep1ProductJson] = useState<string>("{}");
+  const [step2RatePlanJson, setStep2RatePlanJson] = useState<string>("{}");
+  const [step3ChargeJson, setStep3ChargeJson] = useState<string>("");
+
+  const [step1Error, setStep1Error] = useState<string | null>(null);
+  const [step2Error, setStep2Error] = useState<string | null>(null);
+  const [step3Error, setStep3Error] = useState<string | null>(null);
+
+  const [preparedPayloads, setPreparedPayloads] = useState<{
+    step1: any | null;
+    step2: any | null;
+    step3: any | null;
+  }>({
+    step1: null,
+    step2: null,
+    step3: null,
+  });
 
   // ---- Conversation ID utilities ----
   const CONV_STORAGE_PREFIX = "pm_conversation_id";
@@ -381,7 +777,7 @@ export default function WorkflowPage() {
   const storageKeyForPersona = (persona: string) => {
     const path =
       typeof window !== "undefined" ? window.location.pathname : "root";
-    return `${CONV_STORAGE_PREFIX}:${persona}:${path}`;
+    return `${CONV_STORAGE_PREFIX}:${persona}`;
   };
 
   const getOrCreateConversationId = (
@@ -425,18 +821,52 @@ export default function WorkflowPage() {
   const chatContainerRef = useRef<HTMLDivElement>(null);
   const chatInputRef = useRef<HTMLInputElement>(null);
   const chatBottomRef = useRef<HTMLDivElement>(null);
+  const [isExecuting, setIsExecuting] = useState(false);
 
   // Chat history state
   const [conversations, setConversations] = useState<
     StoredConversationSummary[]
   >([]);
-  const [activeConversationId, setActiveConversationId] =
-    useState<string | null>(null);
+  const [activeConversationId, setActiveConversationId] = useState<
+    string | null
+  >(null);
+  type SortOrder = "desc" | "asc";
+  const [chatSortOrder, setChatSortOrder] = useState<SortOrder>("desc");
+  const sortedConversations = useMemo(() => {
+    return [...conversations].sort((a, b) => {
+      const aTime = new Date(a.updatedAt).getTime();
+      const bTime = new Date(b.updatedAt).getTime();
+
+      return chatSortOrder === "desc" ? bTime - aTime : aTime - bTime;
+    });
+  }, [conversations, chatSortOrder]);
+
+  const zuoraActionLabel = useMemo(() => {
+    if (!activeConversationId) return null;
+
+    const items = conversationPayloads[activeConversationId] || [];
+    if (!items.length) return null;
+
+    const types = items.map((i) =>
+      (i.zuora_api_type || i.name || "").toLowerCase()
+    );
+
+    if (types.some((t) => t.includes("product_create")))
+      return "This will create a new product in Zuora.";
+
+    if (types.some((t) => t.includes("product_update")))
+      return "This will update the existing product in Zuora.";
+
+    if (types.some((t) => t.includes("product_view")))
+      return "This will fetch product details from Zuora.";
+
+    return "This will execute the selected operation in Zuora.";
+  }, [conversationPayloads, activeConversationId]);
 
   // [CHAT-API] Persona + Conversation ID
   const CHAT_API_URL =
     "https://7ajwemkf19.execute-api.us-east-2.amazonaws.com/demo/chat";
-  const CHAT_PERSONA = "Architect";
+  const CHAT_PERSONA = "ProductManager";
 
   const [conversationId, setConversationId] = useState<string>(() => {
     return getOrCreateConversationId(CHAT_PERSONA);
@@ -457,7 +887,6 @@ export default function WorkflowPage() {
     }
   };
 
-  // Add states
   const [connecting, setConnecting] = useState(false);
   const [errors, setErrors] = useState<{
     environment?: string;
@@ -471,8 +900,21 @@ export default function WorkflowPage() {
     baseUrl: string;
     scope?: string | null;
   }>(null);
+  const touchConversation = (convId: string) => {
+    const nowIso = new Date().toISOString();
+  
+    setConversations((prev) => {
+      const idx = prev.findIndex((c) => c.id === convId);
+      if (idx === -1) return prev;
+  
+      const updated = { ...prev[idx], updatedAt: nowIso };
+      const others = prev.filter((c) => c.id !== convId);
+  
+      return [updated, ...others]; // 🔥 reorder ONLY here
+    });
+  };
 
-  // Add a small validator
+      
   const validateConnectForm = () => {
     const next: typeof errors = {};
     if (!environment) next.environment = "Please select an environment.";
@@ -481,79 +923,261 @@ export default function WorkflowPage() {
     setErrors(next);
     return Object.keys(next).length === 0;
   };
-
-  // hydrate chat history & initial active conversation from localStorage
+  // 🔁 Whenever we switch conversations, rebuild the Zuora workspace
   useEffect(() => {
-    if (typeof window === "undefined") return;
+    if (!activeConversationId) return;
 
-    const initialConvId =
-      sanitizeConvId(conversationId) || getOrCreateConversationId(CHAT_PERSONA);
-    setConversationId(initialConvId);
-    setActiveConversationId(initialConvId);
+    const items =
+      activeConversationId && conversationPayloads[activeConversationId]
+        ? conversationPayloads[activeConversationId]
+        : [];
 
+
+
+    const restoredSteps = buildZuoraStepsFromPayloads(
+      activeConversationId,
+      items
+    );
+
+    setZuoraSteps(restoredSteps);
+    setShowPayload(true);
+  }, [activeConversationId, conversationPayloads]);
+
+
+  useEffect(() => {
+    if (!activeConversationId) return;
+  
+    const items = conversationPayloads[activeConversationId];
+  
+    // 🟥 No payloads yet → hide preview
+    if (!items || items.length === 0) {
+      setZuoraSteps([]);
+      // setShowPayload(false);
+      return;
+    }
+  
+    // 🟢 Payloads exist → build + show preview
+    const restoredSteps = buildZuoraStepsFromPayloads(
+      activeConversationId,
+      items
+    );
+  
+    setZuoraSteps(restoredSteps);
+    setShowPayload(true);
+  }, [activeConversationId, conversationPayloads]);
+
+  
+  // 🟥 HYDRATION DEBUG LOGGER
+
+  useEffect(() => {
+    if (hydrationDidRun.current) {
+      console.log("%c[HYDRATE] Skipped (already ran once)", "color:red");
+      return;
+    }
+    hydrationDidRun.current = true;
+
+    console.log("%c[HYDRATE] 🚀 Starting hydration", "color: orange");
+
+    if (typeof window === "undefined") {
+      console.log("[HYDRATE] ❌ window === undefined (SSR)");
+      return;
+    }
+
+    // ---------------------------------------------------
+    // 1️⃣ Load all saved conversations
+    // ---------------------------------------------------
     let savedConversations: StoredConversationSummary[] = [];
     try {
       const raw = localStorage.getItem(CHAT_CONVERSATIONS_KEY);
+      console.log("[HYDRATE] Raw conversations from LS:", raw);
+
       if (raw) {
         const parsed = JSON.parse(raw);
         if (Array.isArray(parsed)) {
-          savedConversations = parsed.filter(
-            (c: any) =>
-              c &&
-              typeof c.id === "string" &&
-              typeof c.title === "string" &&
-              typeof c.createdAt === "string" &&
-              typeof c.updatedAt === "string"
-          );
+          savedConversations = parsed;
         }
       }
-    } catch {
-      // ignore parse errors
+    } catch (err) {
+      console.error("[HYDRATE] ❌ Error parsing conversations:", err);
     }
 
-    const nowIso = new Date().toISOString();
-    if (!savedConversations.find((c) => c.id === initialConvId)) {
-      savedConversations = [
-        {
-          id: initialConvId,
-          title: "New chat",
-          createdAt: nowIso,
-          updatedAt: nowIso,
-        },
-        ...savedConversations,
-      ];
-    }
-    setConversations(savedConversations);
+    console.log("[HYDRATE] Final savedConversations:", savedConversations);
 
-    // load messages for active conversation
-    try {
-      const msgsKey = `${CHAT_MESSAGES_KEY_PREFIX}:${initialConvId}`;
-      const stored = localStorage.getItem(msgsKey);
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        if (Array.isArray(parsed)) {
-          const restored: ChatMessage[] = parsed
-            .filter(
-              (m: any) =>
-                m &&
-                (m.role === "assistant" || m.role === "user") &&
-                typeof m.content === "string" &&
-                typeof m.timestamp === "string"
-            )
-            .map((m: any) => ({
-              role: m.role,
-              content: m.content,
+    if (savedConversations.length > 0) {
+      console.log("[HYDRATE] 🚀 Applying conversations → setConversations");
+      setConversations(savedConversations);
+    } else {
+      console.log("[HYDRATE] ⚠️ No saved convos found");
+    }
+
+    // ---------------------------------------------------
+    // DELAYED HYDRATION LOGIC
+    // ---------------------------------------------------
+    setTimeout(() => {
+      console.log(
+        "%c[HYDRATE] ⏳ Running delayed selection logic",
+        "color: cyan"
+      );
+
+      // 🟥 If there are NO conversations → create first one
+      if (savedConversations.length === 0) {
+        console.log("[HYDRATE] 🆕 Creating FIRST conversation");
+
+        const newId = crypto.randomUUID();
+        const now = new Date().toISOString();
+        const first = [
+          {
+            id: newId,
+            title: "New chat",
+            createdAt: now,
+            updatedAt: now,
+          },
+        ];
+
+        localStorage.setItem(CHAT_CONVERSATIONS_KEY, JSON.stringify(first));
+        setActiveConversationId(newId);
+        setConversations(first);
+        setChatMessages([
+          {
+            role: "assistant",
+            content:
+              "Hi, I'm Zia — your AI  Architect. Let's connect to Zuora and manage your Product Catalog.",
+            timestamp: new Date(),
+          },
+        ]);
+
+        return;
+      }
+
+      // ---------------------------------------------------
+      // 2️⃣ Determine what to do with the MOST RECENT conversation
+      // Your conversations are sorted newest → oldest
+      // ---------------------------------------------------
+      const lastConv = savedConversations[0];
+      console.log("[HYDRATE] Checking most recent conversation:", lastConv.id);
+
+      const msgsKey = `${CHAT_MESSAGES_KEY_PREFIX}:${lastConv.id}`;
+      console.log("[HYDRATE] Attempt loading messages from:", msgsKey);
+
+      let restoredMsgs: ChatMessage[] = [];
+      try {
+        const rawMsgs = localStorage.getItem(msgsKey);
+        console.log("[HYDRATE] Raw stored messages:", rawMsgs);
+
+        if (rawMsgs) {
+          const parsed = JSON.parse(rawMsgs);
+          if (Array.isArray(parsed)) {
+            restoredMsgs = parsed.map((m) => ({
+              ...m,
               timestamp: new Date(m.timestamp),
             }));
-          if (restored.length > 0) {
-            setChatMessages(restored);
           }
         }
+      } catch (err) {
+        console.error("[HYDRATE] ❌ Error loading messages:", err);
       }
+
+      console.log("[HYDRATE] RestoredMsgs count:", restoredMsgs.length);
+
+      // ---------------------------------------------------
+      // 🟢 RULE:
+      // If last conversation has ANY messages → Create a NEW chat
+      // ---------------------------------------------------
+      if (restoredMsgs.length > 1) {
+        console.log(
+          "%c[HYDRATE] Last chat has messages → creating NEW chat",
+          "color:green"
+        );
+
+        const newId = crypto.randomUUID();
+        const nowIso = new Date().toISOString();
+
+        const updated = [
+          {
+            id: newId,
+            title: "New chat",
+            createdAt: nowIso,
+            updatedAt: nowIso,
+          },
+          ...savedConversations, // keep old chats
+        ];
+
+        setConversations(updated);
+        setActiveConversationId(newId);
+        setChatMessages([
+          {
+            role: "assistant",
+            content:
+              "Hi, I'm Zia — your AI  Architect. Let's connect to Zuora and manage your Product Catalog.",
+            timestamp: new Date(),
+          },
+        ]);
+
+        localStorage.setItem(CHAT_CONVERSATIONS_KEY, JSON.stringify(updated));
+
+        // store for persona
+        const key = storageKeyForPersona(CHAT_PERSONA);
+        sessionStorage.setItem(key, newId);
+
+        console.log(
+          "%c[HYDRATE] 🆕 New chat created and selected",
+          "color:lightgreen"
+        );
+        return;
+      }
+
+      // ---------------------------------------------------
+      // 🟦 OTHERWISE → Continue existing EMPTY conversation
+      // ---------------------------------------------------
+      console.log(
+        "%c[HYDRATE] Continuing existing empty conversation",
+        "color:blue"
+      );
+
+      setActiveConversationId(lastConv.id);
+      setChatMessages([
+        {
+          role: "assistant",
+          content:
+            "Hi, I'm Zia — your AI  Architect. Let's connect to Zuora and manage your Product Catalog.",
+          timestamp: new Date(),
+        },
+      ]);
+
+      // also store persona mapping
+      const personaKey = storageKeyForPersona(CHAT_PERSONA);
+      sessionStorage.setItem(personaKey, lastConv.id);
+
+      // ---------------------------------------------------
+      // 3️⃣ Load payloads
+      // ---------------------------------------------------
+      try {
+        const rawPayloads = localStorage.getItem(CHAT_ZUORA_PAYLOADS_KEY);
+        if (rawPayloads) {
+          const parsed = JSON.parse(rawPayloads);
+          if (parsed && typeof parsed === "object") {
+            setConversationPayloads(parsed);
+          }
+        }
+      } catch (err) {
+        console.error("[HYDRATE] ❌ Error parsing payloads:", err);
+      }
+
+      console.log("%c[HYDRATE] 🟢 Hydration complete!", "color: lightgreen");
+    }, 0);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      localStorage.setItem(
+        CHAT_ZUORA_PAYLOADS_KEY,
+        JSON.stringify(conversationPayloads)
+      );
     } catch {
-      // ignore
+      // ignore storage errors
     }
-  }, []); // run once
+  }, [conversationPayloads]);
 
   // persist conversations list
   useEffect(() => {
@@ -568,62 +1192,36 @@ export default function WorkflowPage() {
     }
   }, [conversations]);
 
-  // persist messages for the active conversation + keep titles fresh
   useEffect(() => {
     if (typeof window === "undefined") return;
     if (!activeConversationId) return;
-
+  
     try {
       const serialized = chatMessages.map((m) => ({
         role: m.role,
         content: m.content,
         timestamp: m.timestamp.toISOString(),
+        fromApi: m.fromApi === true,
       }));
+  
       localStorage.setItem(
         `${CHAT_MESSAGES_KEY_PREFIX}:${activeConversationId}`,
         JSON.stringify(serialized)
       );
-
+  
+      // ✅ ONLY update title here (safe)
       const title = deriveTitleFromMessages(chatMessages);
-      const nowIso = new Date().toISOString();
-
-      setConversations((prev) => {
-        if (!prev || prev.length === 0) {
-          return [
-            {
-              id: activeConversationId,
-              title,
-              createdAt: nowIso,
-              updatedAt: nowIso,
-            },
-          ];
-        }
-
-        const existingIndex = prev.findIndex(
-          (c) => c.id === activeConversationId
-        );
-        const base: StoredConversationSummary =
-          existingIndex >= 0
-            ? { ...prev[existingIndex] }
-            : {
-                id: activeConversationId,
-                title,
-                createdAt: nowIso,
-                updatedAt: nowIso,
-              };
-
-        base.title = title;
-        base.updatedAt = nowIso;
-
-        const others = prev.filter((c) => c.id !== activeConversationId);
-        return [base, ...others].sort((a, b) =>
-          a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0
-        );
-      });
+  
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id === activeConversationId ? { ...c, title } : c
+        )
+      );
     } catch {
       // ignore
     }
   }, [chatMessages, activeConversationId]);
+  
 
   useEffect(() => {
     if (chatContainerRef.current && isUserAtBottom) {
@@ -661,24 +1259,36 @@ export default function WorkflowPage() {
 
   const addAssistantMessage = (content: string, delay = 300) => {
     setIsTyping(true);
+  
     setTimeout(() => {
       setIsTyping(false);
+  
       setChatMessages((prev) => [
         ...prev,
-        { role: "assistant", content, timestamp: new Date() },
+        { role: "assistant", content, timestamp: new Date(), fromApi: true },
       ]);
+  
+      if (activeConversationId) {
+        touchConversation(activeConversationId);
+      }
+  
       requestAnimationFrame(() => scrollToBottom(true));
     }, delay);
   };
+  
 
   const addUserMessage = (content: string) => {
     setChatMessages((prev) => [
       ...prev,
       { role: "user", content, timestamp: new Date() },
     ]);
+  
+    if (activeConversationId) {
+      touchConversation(activeConversationId);
+    }
   };
+  
 
-  // Map quick actions → starter prompts for the chat service
   const actionPromptMap: Record<Exclude<ConversationFlow, "idle">, string> = {
     "create-product": "I want to create a product.",
     "update-product": "I want to update an existing product.",
@@ -686,19 +1296,14 @@ export default function WorkflowPage() {
     "view-product": "I want to view product details from my catalog.",
   };
 
-  // Kick off an action and trigger the chat API with a starter prompt
   const startActionWithChat = (action: Exclude<ConversationFlow, "idle">) => {
-    // respect your connection guard already in handleQuickAction
     handleQuickAction(action);
     if (!isConnected) return;
 
     const userPrompt = actionPromptMap[action];
     if (!userPrompt) return;
 
-    // show user's intent in the chat UI
     addUserMessage(userPrompt);
-
-    // call your existing chat API integration
     sendChatToApi(userPrompt);
   };
 
@@ -706,6 +1311,7 @@ export default function WorkflowPage() {
   const sendChatToApi = async (message: string) => {
     try {
       setIsTyping(true);
+
       const safeConvId =
         sanitizeConvId(conversationId) ??
         getOrCreateConversationId(CHAT_PERSONA);
@@ -717,19 +1323,25 @@ export default function WorkflowPage() {
           persona: CHAT_PERSONA,
           message,
           conversation_id: safeConvId,
+          // ✅ send back whatever is stored for this conversation,
+          // converted only for classic product/rateplan/charge flows
+          zuora_api_payloads: revertZuoraApiPayloads(
+            conversationPayloads[safeConvId] || []
+          ),
         }),
       });
 
-      // Read as text first (defensive against non-JSON error bodies)
       const raw = await res.text();
       let data: any = {};
       try {
         data = raw ? JSON.parse(raw) : {};
       } catch {
-        // leave data as {}
+        // ignore parse errors from backend
       }
 
-      // Accept common shapes: prefer `answer`, then others
+      // --------------------------
+      // MAIN REPLY
+      // --------------------------
       const reply: string =
         data?.answer ??
         data?.reply ??
@@ -740,77 +1352,98 @@ export default function WorkflowPage() {
           ? "(No reply content)"
           : `Error: ${res.status} ${res.statusText}`);
 
-      // Pick up conversation id if backend returns/changes it
+      // --------------------------
+      // UPDATE CONVERSATION ID
+      // --------------------------
       const returnedConvId =
         data?.conversation_id || data?.conversationId || data?.conv_id;
+
       if (returnedConvId && returnedConvId !== conversationId) {
         setConversationId(returnedConvId);
+
         if (typeof window !== "undefined") {
           const key = storageKeyForPersona(CHAT_PERSONA);
           sessionStorage.setItem(key, returnedConvId);
         }
+
         setActiveConversationId(returnedConvId);
       }
 
-      // Optional: show citations compactly if provided
+      // --------------------------
+      // CITATIONS (optional)
+      // --------------------------
       let citationsSuffix = "";
       if (Array.isArray(data?.citations) && data.citations.length > 0) {
         const firstThree = data.citations.slice(0, 3);
-        const labels = firstThree
-          .map((c: any) => c?.title || c?.id)
+
+        const links = firstThree
+          .map((c: any, idx: number) => {
+            const rawLabel = c?.title || c?.id || `Source ${idx + 1}`;
+            // basic HTML-escape for label
+            const label = String(rawLabel)
+              .replace(/&/g, "&amp;")
+              .replace(/</g, "&lt;")
+              .replace(/>/g, "&gt;");
+
+            const url = typeof c?.url === "string" ? c.url : undefined;
+            if (!url) return label;
+
+            const safeUrl =
+              url.startsWith("http://") || url.startsWith("https://")
+                ? url
+                : `https://${url}`;
+            return `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer" class="text-blue-600 hover:underline">${label}</a>`;
+          })
           .join(", ");
+
         const more =
           data.citations.length > 3
             ? ` +${data.citations.length - 3} more`
             : "";
-        citationsSuffix = `\n\n— sources: ${labels}${more}`;
+
+        // appended to HTML LLM answer, rendered via dangerouslySetInnerHTML
+        citationsSuffix = `<div class="mt-3 text-xs text-gray-500">— sources: ${links}${more}</div>`;
       }
 
-      // === NEW: If the API returned zuora_api_payloads (array), build preview + product body ===
-    
-      // === Map zuora_api_payloads → unified createProduct body + preview ===
-      const payloadItems: ZuoraPayloadItem[] = Array.isArray(
-        data?.zuora_api_payloads
-      )
-        ? data.zuora_api_payloads
-        : [];
+      // ======================================================
+      //  HANDLE DYNAMIC ZUORA API PAYLOADS FROM LLM
+      // ======================================================
+      // ======================================================
+      //  HANDLE DYNAMIC ZUORA API PAYLOADS FROM LLM
+      // ======================================================
+      if (
+        Array.isArray(data?.zuora_api_payloads) &&
+        data.zuora_api_payloads.length > 0
+      ) {
+        const items = data.zuora_api_payloads as ZuoraPayloadItem[];
 
-      if (payloadItems.length > 0) {
-        // Build the body that your Lambda expects (product + ratePlans)
-        const unifiedBody = mapZuoraPayloadsToCreateBody(payloadItems);
+        // Build workspace steps from these payloads
+        const newSteps = buildZuoraStepsFromPayloads(safeConvId, items);
+        setZuoraSteps(newSteps);
+        setShowPayload(true);
 
-        // 👉 This is what handleExecute will send as "body"
-        setZuoraGeneratedBody(unifiedBody);
+        // addAssistantMessage(
+        //   "The Zuora API payloads are ready. You can review and make any edits in the workspace preview on the right",
+        //   150
+        // );
 
-        // Preview JSON in the right-side panel
-        const pretty = JSON.stringify(unifiedBody, null, 2);
-        setApiPayloadText(pretty);
-
-        // Optional: sync basics into UI summary
-        setProductData((prev) => ({
+        // Save raw (but normalized) payloads per conversation
+        setConversationPayloads((prev) => ({
           ...prev,
-          name: unifiedBody.name || prev.name,
-          sku: unifiedBody.productCode || prev.sku,
-          description: unifiedBody.description || prev.description,
-          startDate: unifiedBody.effectiveStartDate || prev.startDate,
+          [safeConvId]: items,
         }));
-
-        addAssistantMessage(
-          "I generated product and rate plan payloads for Zuora. Opening preview…",
-          200
-        );
-        handleGeneratePayload();
       }
 
-
-
-      // Append the normal assistant reply (with compact citations if any)
+      // --------------------------
+      // APPEND REPLY TO CHAT
+      // --------------------------
       setChatMessages((prev) => [
         ...prev,
         {
           role: "assistant",
           content: String(reply) + citationsSuffix,
           timestamp: new Date(),
+          fromApi: true, // ⬅️ mark as LLM/API reply
         },
       ]);
     } catch (e) {
@@ -819,7 +1452,7 @@ export default function WorkflowPage() {
         {
           role: "assistant",
           content:
-            "Sorry, I couldn't reach the chat service. Please try again in a moment.",
+            "Sorry, I couldn't reach the chat service. Please try again shortly.",
           timestamp: new Date(),
         },
       ]);
@@ -885,7 +1518,11 @@ export default function WorkflowPage() {
           `${res.status} ${res.statusText}`;
         setIsConnected(false);
         setTokenInfo(null);
-        setToastMessage(`Connection failed: ${reason}`);
+        setToastMessage({
+          message: `Connection failed: ${reason}`,
+          type: "error",
+        });
+
         addAssistantMessage(
           "I couldn't connect. Please check your credentials and environment.",
           200
@@ -901,15 +1538,22 @@ export default function WorkflowPage() {
         baseUrl,
         scope: data.scope ?? null,
       });
-      setToastMessage("Successfully connected to Zuora!");
+      setToastMessage({
+        message: "Successfully connected to Zuora!",
+        type: "success",
+      });
+
       addAssistantMessage(
-        "Great! You're now connected. What would you like to do first — Create, Update, Expire, or View a product?",
+        "Great! You're now connected. What would you like to do firsts",
         600
       );
     } catch (e: any) {
       setIsConnected(false);
       setTokenInfo(null);
-      setToastMessage(`Connection error: ${e?.message ?? "Unexpected error"}`);
+      setToastMessage({
+        message: e.message || "Unexpected error occurred",
+        type: "error",
+      });
     } finally {
       setConnecting(false);
     }
@@ -937,25 +1581,13 @@ export default function WorkflowPage() {
       "view-product": "View Product",
     } as const;
 
-    if (action !== "idle") {
-      addAssistantMessage(
-        `Understood. Let's start with ${actionNames[action]}. I'm fetching relevant details from Zuora.`,
-        300
-      );
-    }
-
     if (action === "create-product") {
       setCreateProductStep("name");
     } else if (action === "update-product") {
       setUpdateProductStep("identify");
     } else if (action === "expire-product") {
-      // no-op for now
+      setExpireProductStep("identify");
     } else if (action === "view-product") {
-      setViewProductStep("choose-scope");
-      addAssistantMessage(
-        "Would you like to view details of a specific product or all products in the catalog?",
-        900
-      );
     }
   };
 
@@ -966,10 +1598,9 @@ export default function WorkflowPage() {
     setConversationId(freshId);
     setActiveConversationId(freshId);
 
-    if (typeof window !== "undefined") {
-      const key = storageKeyForPersona(CHAT_PERSONA);
-      sessionStorage.setItem(key, freshId);
-    }
+    if (typeof window === "undefined") return;
+    const key = storageKeyForPersona(CHAT_PERSONA);
+    sessionStorage.setItem(key, freshId);
 
     const nowIso = new Date().toISOString();
     setConversations((prev) => [
@@ -986,7 +1617,7 @@ export default function WorkflowPage() {
       {
         role: "assistant",
         content:
-          "Hi, I'm Zia — your AI configuration assistant. Let's connect to Zuora and manage your Product Catalog.",
+          "Hi, I'm Zia — your AI  Architect. Let's connect to Zuora and manage your Product Catalog.",
         timestamp: new Date(),
       },
     ]);
@@ -1016,96 +1647,83 @@ export default function WorkflowPage() {
     setValidationResults([]);
     setExecutionResult(null);
     setShowPayload(false);
+    setPreparedPayloads({ step1: null, step2: null, step3: null });
   };
 
-  // NEW: switch to a previous conversation
   const handleSelectConversation = (id: string) => {
-    if (id === activeConversationId) return;
+    console.log("%c[SELECT] User selected conversation:", "color: purple", id);
 
+    console.log("[SELECT] activeConversationId before:", activeConversationId);
     setActiveConversationId(id);
     setConversationId(id);
 
     if (typeof window !== "undefined") {
       const key = storageKeyForPersona(CHAT_PERSONA);
+      console.log("[SELECT] Saving to sessionStorage:", key, id);
       sessionStorage.setItem(key, id);
     }
 
-    let restored: ChatMessage[] | null = null;
+    // load messages
+    const msgKey = `${CHAT_MESSAGES_KEY_PREFIX}:${id}`;
+    console.log("[SELECT] Loading messages from key:", msgKey);
 
-    if (typeof window !== "undefined") {
-      try {
-        const stored = localStorage.getItem(`${CHAT_MESSAGES_KEY_PREFIX}:${id}`);
-        if (stored) {
-          const parsed = JSON.parse(stored);
-          if (Array.isArray(parsed)) {
-            restored = parsed
-              .filter(
-                (m: any) =>
-                  m &&
-                  (m.role === "assistant" || m.role === "user") &&
-                  typeof m.content === "string" &&
-                  typeof m.timestamp === "string"
-              )
-              .map((m: any) => ({
-                role: m.role,
-                content: m.content,
-                timestamp: new Date(m.timestamp),
-              }));
-          }
+    try {
+      const raw = localStorage.getItem(msgKey);
+      console.log("[SELECT] Raw messages:", raw);
+
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        console.log("[SELECT] Parsed messages:", parsed);
+
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          console.log(
+            "%c[SELECT] Restoring full message history",
+            "color: green"
+          );
+          setChatMessages(
+            parsed.map((m) => ({
+              ...m,
+              timestamp: new Date(m.timestamp),
+            }))
+          );
+          return;
         }
-      } catch {
-        // ignore
       }
+    } catch (err) {
+      console.error("[SELECT] Error restoring messages:", err);
     }
 
-    setChatMessages(
-      restored && restored.length
-        ? restored
-        : [
-            {
-              role: "assistant",
-              content:
-                "Hi, I'm Zia — your AI configuration assistant. Let's connect to Zuora and manage your Product Catalog.",
-              timestamp: new Date(),
-            },
-          ]
+    console.log(
+      "%c[SELECT] No messages found, leaving chatMessages unchanged",
+      "color: orange"
     );
-
-    // reset flows + workspace state
-    setCurrentFlow("idle");
-    setCreateProductStep("name");
-    setUpdateProductStep("identify");
-    setExpireProductStep("identify");
-    setViewProductStep("choose-scope");
-
-    setProductData({
-      name: "",
-      sku: "",
-      description: "",
-      startDate: "",
-      ratePlans: [],
-    });
-    setCurrentRatePlan({ name: "", description: "", charges: [] });
-    setSelectedProduct(null);
-    setSelectedAttribute("");
-    setNewAttributeValue("");
-    setExpireMethod("");
-    setExpireDate("");
-    setViewScope("specific");
-    setViewDetailType("");
-    setValidationResults([]);
-    setExecutionResult(null);
-    setShowPayload(false);
   };
 
   // [CHAT-API] integrate API call on submit
   const handleChatSubmit = () => {
+    // 🚫 Don’t allow another send while waiting for API
+    if (isTyping) return;
+
     if (!chatInput.trim()) return;
 
     const input = chatInput.trim();
+
+    // ⛔ Block chat if not connected to Zuora
+    if (!isConnected) {
+      // Optional: still show the user’s message in the thread
+      addUserMessage(input);
+
+      setHighlightConnect(true);
+      addAssistantMessage(
+        "You're not connected to Zuora yet. Please connect using the panel above before asking catalog questions."
+      );
+
+      setChatInput("");
+      requestAnimationFrame(() => scrollToBottom(true));
+      return;
+    }
     addUserMessage(input);
 
-    // Fire product-manager flows (your existing logic)
     if (currentFlow === "create-product") {
       handleCreateProductFlow(input);
     } else if (currentFlow === "update-product") {
@@ -1116,7 +1734,6 @@ export default function WorkflowPage() {
       handleViewProductFlow(input);
     }
 
-    // Also send every user message to chat API
     void sendChatToApi(input);
 
     setChatInput("");
@@ -1167,122 +1784,10 @@ export default function WorkflowPage() {
   };
 
   const handleCreateProductFlow = (input: string) => {
-    // your flow for create-product can be filled here later
+    // you can wire your conversational create-product wizard here if needed
   };
 
-  const handleUpdateProductFlow = (input: string) => {
-    if (updateProductStep === "identify") {
-      const mockProduct = {
-        id: "P-000234",
-        name: input,
-        sku: "SOLAR-001",
-        description: "Solar Plan Basic",
-        effectiveStart: "2024-01-01",
-        effectiveEnd: "2026-12-31",
-        currency: "US, Canada",
-      };
-      setSelectedProduct(mockProduct);
-      setUpdateProductStep("show-summary");
-
-      setTimeout(() => {
-        addAssistantMessage(
-          `Found product: ${mockProduct.description}\n\nProduct ID: ${mockProduct.id}\nSKU: ${mockProduct.sku}\nEffective Start: ${mockProduct.effectiveStart}\nEffective End: ${mockProduct.effectiveEnd}\nCurrency: ${mockProduct.currency}\n\nWhat would you like to update?`,
-          600
-        );
-      }, 300);
-    } else if (updateProductStep === "show-summary") {
-      setUpdateProductStep("select-attribute");
-      setTimeout(() => {
-        addAssistantMessage(
-          "Please select what you'd like to update:\n1. Name\n2. SKU\n3. Description\n4. Effective Start Date\n5. Effective End Date\n6. Custom Fields\n7. Product Rate Plans\n\nType the number or name.",
-          300
-        );
-      }, 300);
-    } else if (updateProductStep === "select-attribute") {
-      const attributeMap: Record<string, string> = {
-        "1": "Name",
-        "2": "SKU",
-        "3": "Description",
-        "4": "Effective Start Date",
-        "5": "Effective End Date",
-        "6": "Custom Fields",
-        "7": "Product Rate Plans",
-        name: "Name",
-        sku: "SKU",
-        description: "Description",
-        "start date": "Effective Start Date",
-        "end date": "Effective End Date",
-        "custom fields": "Custom Fields",
-        "rate plans": "Product Rate Plans",
-      };
-
-      const selected = attributeMap[input.toLowerCase()];
-      if (selected) {
-        setSelectedAttribute(selected);
-        setUpdateProductStep("update-value");
-        setTimeout(() => {
-          addAssistantMessage(`What's the new value for ${selected}?`, 300);
-        }, 300);
-      } else {
-        setTimeout(() => {
-          addAssistantMessage(
-            "Please select a valid option (1-7 or type the attribute name).",
-            300
-          );
-        }, 300);
-      }
-    } else if (updateProductStep === "update-value") {
-      setNewAttributeValue(input);
-      setUpdateProductStep("confirm");
-
-      setTimeout(() => {
-        addAssistantMessage(
-          `⚠️ Note: This change will be effective for new subscriptions only.\n\n✅ Product: ${selectedProduct.description}\n🔁 Change: ${selectedAttribute} → ${input}\n\nDo you want me to proceed with this update?`,
-          600
-        );
-      }, 300);
-    } else if (updateProductStep === "confirm") {
-      if (input.toLowerCase() === "yes" || input.toLowerCase() === "y") {
-        setUpdateProductStep("execute");
-        setTimeout(() => {
-          addAssistantMessage("✅ Update submitted successfully.", 600);
-          setTimeout(() => {
-            addAssistantMessage(
-              "Would you like to update another attribute?",
-              300
-            );
-            setUpdateProductStep("another-attribute");
-          }, 1200);
-        }, 300);
-      } else {
-        setTimeout(() => {
-          addAssistantMessage(
-            "Okay, no changes applied. Would you like to update a different attribute?",
-            300
-          );
-          setUpdateProductStep("another-attribute");
-        }, 300);
-      }
-    } else if (updateProductStep === "another-attribute") {
-      if (input.toLowerCase() === "yes" || input.toLowerCase() === "y") {
-        setUpdateProductStep("select-attribute");
-        setTimeout(() => {
-          addAssistantMessage(
-            "Please select what you'd like to update:\n1. Name\n2. SKU\n3. Description\n4. Effective Start Date\n5. Effective End Date\n6. Custom Fields\n7. Product Rate Plans",
-            300
-          );
-        }, 300);
-      } else {
-        setTimeout(() => {
-          addAssistantMessage(
-            "Update complete! What would you like to do next?",
-            300
-          );
-          completeCurrentFlow();
-        }, 300);
-      }
-    }
-  };
+  const handleUpdateProductFlow = (input: string) => {};
 
   const handleExpireProductFlow = (input: string) => {
     if (expireProductStep === "identify") {
@@ -1294,15 +1799,6 @@ export default function WorkflowPage() {
         effectiveStart: "2024-01-01",
         effectiveEnd: "2027-12-31",
       };
-      setSelectedProduct(mockProduct);
-      setExpireProductStep("show-details");
-
-      setTimeout(() => {
-        addAssistantMessage(
-          `Found product: ${mockProduct.description}\n\nProduct ID: ${mockProduct.id}\nEffective Start: ${mockProduct.effectiveStart}\nEffective End: ${mockProduct.effectiveEnd}\n\nWould you like to change its End Date to expire it?`,
-          600
-        );
-      }, 300);
     } else if (expireProductStep === "show-details") {
       if (input.toLowerCase() === "yes" || input.toLowerCase() === "y") {
         setExpireProductStep("select-method");
@@ -1391,7 +1887,11 @@ export default function WorkflowPage() {
         setExpireProductStep("execute");
         setTimeout(() => {
           addAssistantMessage("✅ Product expired successfully.", 600);
-          setToastMessage("Product expired successfully");
+          setToastMessage({
+            message: "Product expired successfully",
+            type: "success",
+          });
+
           setTimeout(() => {
             completeCurrentFlow();
           }, 1500);
@@ -1405,156 +1905,50 @@ export default function WorkflowPage() {
     }
   };
 
-  const handleViewProductFlow = (input: string) => {
-    if (viewProductStep === "choose-scope") {
-      if (input.toLowerCase().includes("specific")) {
-        setViewScope("specific");
-        setViewProductStep("identify");
-        setTimeout(() => {
-          addAssistantMessage(
-            "Please provide the Product Name, ID, or SKU.",
-            300
-          );
-        }, 300);
-      } else if (input.toLowerCase().includes("all")) {
-        setViewScope("all");
-        setViewProductStep("show-summary");
-        setTimeout(() => {
-          addAssistantMessage(
-            "Here are all products in your catalog:\n\n1. Solar Plan Basic (SOLAR-001)\n2. Solar Plan Premium (SOLAR-PREM-001)\n3. Enterprise SaaS Plan (ENT-SAAS-001)\n\nWould you like to view details of a specific product?",
-            600
-          );
-        }, 300);
-      } else {
-        setTimeout(() => {
-          addAssistantMessage(
-            "Please specify 'specific product' or 'all products'.",
-            300
-          );
-        }, 300);
-      }
-    } else if (viewProductStep === "identify") {
-      const mockProduct = {
-        id: "P-000234",
-        name: input,
-        sku: "SOLAR-PREM-001",
-        description: "Solar Plan Premium",
-        effectiveStart: "2024-01-01",
-        effectiveEnd: "2027-12-31",
-        orgUnits: "US, Canada, Europe",
-      };
-      setSelectedProduct(mockProduct);
-      setViewProductStep("show-summary");
+  const handleViewProductFlow = (input: string) => {};
 
-      setTimeout(() => {
-        addAssistantMessage(
-          `Product ID: ${mockProduct.id}\nSKU: ${mockProduct.sku}\nEffective Start: ${mockProduct.effectiveStart}\nEffective End: ${mockProduct.effectiveEnd}\nOrg Units: ${mockProduct.orgUnits}\n\nWould you like to view more details?`,
-          600
-        );
-      }, 300);
-    } else if (viewProductStep === "show-summary") {
-      if (input.toLowerCase() === "yes" || input.toLowerCase() === "y") {
-        setViewProductStep("select-detail");
-        setTimeout(() => {
-          addAssistantMessage(
-            "What would you like to view?\n1️⃣ Product Info (Name, SKU, Description, Dates)\n2️⃣ Rate Plans & Charges (nested list view)\n3️⃣ Custom Fields\n\nType 1, 2, or 3.",
-            300
-          );
-        }, 300);
-      } else {
-        setTimeout(() => {
-          addAssistantMessage(
-            "Okay. Would you like to view another product or return to the catalog list?",
-            300
-          );
-          setViewProductStep("another-product");
-        }, 300);
-      }
-    } else if (viewProductStep === "select-detail") {
-      const detailMap: Record<string, string> = {
-        "1": "Product Info",
-        "2": "Rate Plans & Charges",
-        "3": "Custom Fields",
-      };
-
-      const detail = detailMap[input];
-      if (detail) {
-        setViewDetailType(detail);
-        setViewProductStep("show-detail");
-
-        setTimeout(() => {
-          if (detail === "Product Info") {
-            addAssistantMessage(
-              `Product Information:\n\nName: ${selectedProduct.description}\nSKU: ${selectedProduct.sku}\nDescription: Premium solar energy plan with advanced features\nEffective Start: ${selectedProduct.effectiveStart}\nEffective End: ${selectedProduct.effectiveEnd}\n\nWould you like to view another detail type?`,
-              600
-            );
-          } else if (detail === "Rate Plans & Charges") {
-            addAssistantMessage(
-              `Rate Plans & Charges:\n\n📋 Annual Plan\n  └─ Flat Fee: $999/year\n  └─ Setup Fee: $100 (one-time)\n\n📋 Monthly Plan\n  └─ Per-Unit: $5/unit\n  └─ Usage: $0.10/API call\n\nWould you like to view another detail type?`,
-              600
-            );
-          } else if (detail === "Custom Fields") {
-            addAssistantMessage(
-              `Custom Fields:\n\nRegion: North America\nTier: Premium\nContract Type: Enterprise\n\nWould you like to view another detail type?`,
-              600
-            );
-          }
-        }, 300);
-      } else {
-        setTimeout(() => {
-          addAssistantMessage(
-            "Please choose a valid option (1, 2, or 3).",
-            300
-          );
-        }, 300);
-      }
-    } else if (viewProductStep === "show-detail") {
-      if (input.toLowerCase() === "yes" || input.toLowerCase() === "y") {
-        setViewProductStep("select-detail");
-        setTimeout(() => {
-          addAssistantMessage(
-            "What would you like to view?\n1️⃣ Product Info\n2️⃣ Rate Plans & Charges\n3️⃣ Custom Fields",
-            300
-          );
-        }, 300);
-      } else {
-        setViewProductStep("another-product");
-        setTimeout(() => {
-          addAssistantMessage(
-            "Would you like to view another product or return to the catalog list?",
-            300
-          );
-        }, 300);
-      }
-    } else if (viewProductStep === "another-product") {
-      if (
-        input.toLowerCase() === "yes" ||
-        input.toLowerCase() === "y" ||
-        input.toLowerCase().includes("another")
-      ) {
-        setViewProductStep("identify");
-        setTimeout(() => {
-          addAssistantMessage(
-            "Please provide the Product Name, ID, or SKU.",
-            300
-          );
-        }, 300);
-      } else {
-        setTimeout(() => {
-          addAssistantMessage("Returning to main menu.", 300);
-          completeCurrentFlow();
-        }, 300);
-      }
-    }
-  };
-
+  // Manual “Preview Payloads” from productData (fallback if no LLM payload)
   const handleGeneratePayload = () => {
+    // simple defaults based on current productData
+    const step1 = {
+      Name: productData.name || "New Product",
+      SKU: productData.sku || "PRO-STARTER-001",
+      Description: productData.description || "",
+      EffectiveStartDate:
+        productData.startDate || new Date().toISOString().split("T")[0],
+      EffectiveEndDate: "2099-12-31",
+    };
+
+    const step2 = {
+      Name: productData.ratePlans[0]?.name || "Base",
+      Description: productData.ratePlans[0]?.description || "",
+      ProductId: "@{Product.Id}",
+    };
+
+    const step3 = {
+      Name: productData.ratePlans[0]?.charges[0]?.name || "Base Charge",
+      ProductRatePlanId: "@{ProductRatePlan.Id}",
+      ChargeModel: "FlatFee",
+      ChargeType: "Recurring",
+      BillingPeriod: "Month",
+      BillingTiming: "InAdvance",
+      Price: 0,
+    };
+
+    setStep1ProductJson(JSON.stringify(step1, null, 2));
+    setStep2RatePlanJson(JSON.stringify(step2, null, 2));
+    setStep3ChargeJson(JSON.stringify(step3, null, 2));
+    setPreparedPayloads({ step1, step2, step3 });
     setShowPayload(true);
+
     setTimeout(() => {
       addAssistantMessage(
-        "Product payload generated! Check the workspace panel on the right."
+        "Product payloads drafted from your current selections. Review each step before execution."
       );
-      setToastMessage("Product draft created successfully");
+      setToastMessage({
+        message: "Product draft created successfully",
+        type: "success",
+      });
     }, 300);
   };
 
@@ -1582,97 +1976,372 @@ export default function WorkflowPage() {
           },
         ];
         setValidationResults(results);
-        addAssistantMessage(
-          "✅ Validation complete! All checks passed. Ready to create in Zuora."
-        );
       }, 1500);
     }, 300);
   };
 
-  // Build correct Zuora Product JSON with cleanup
-  const buildZuoraBody = () => {
-    const raw: any = {
-      Name: productData?.name ?? null,
-      Description: productData?.description ?? null,
-      EffectiveStartDate: productData?.startDate ?? null,
-      EffectiveEndDate: "2099-12-31",
-      SKU: productData?.sku ?? null,
-      ProductRatePlans: (productData?.ratePlans || []).map((rp) => ({
-        Name: rp.name,
-        Description: rp.description || "",
-        ProductRatePlanCharges: (rp.charges || []).map((ch) => ({
-          Name: ch.name,
-          ChargeType: ch.type,
-          Fields: ch.fields || {},
-        })),
-      })),
-    };
-
-    Object.keys(raw).forEach((k) => {
-      const v = raw[k];
-      if (
-        v === null ||
-        v === undefined ||
-        v === "" ||
-        (Array.isArray(v) && v.length === 0)
-      ) {
-        delete raw[k];
-      }
-    });
-
-    return raw;
-  };
-
-
   const handleExecute = async () => {
+    setIsExecuting(true);
+
     if (!clientId || !clientSecret) {
-      setToastMessage("Client ID/Secret required to create product");
+      setToastMessage({
+        message: "Client ID and Client Secret are required",
+        type: "error",
+      });
       addAssistantMessage("Please enter Client ID and Client Secret.");
       return;
     }
-  
+
     setCreateProductStep("execute");
     setExecuting(true);
-    addAssistantMessage("Creating product in Zuora…");
-  
+    const safeConvId =
+      sanitizeConvId(conversationId) ?? getOrCreateConversationId(CHAT_PERSONA);
+
+    const convPayloads = conversationPayloads[safeConvId] || [];
+
+    let executionLabel = "Executing operation in Zuora…";
+
+    const types = convPayloads.map((i) =>
+      (i.zuora_api_type || i.name || "").toLowerCase()
+    );
+
+    if (types.some((t) => t.includes("product_create"))) {
+      executionLabel = "Creating product in Zuora…";
+    } else if (types.some((t) => t.includes("product_update"))) {
+      executionLabel = "Updating product in Zuora…";
+    } else if (types.some((t) => t.includes("product_view"))) {
+      executionLabel = "Fetching product details from Zuora…";
+    } else if (types.some((t) => t.includes("expire"))) {
+      executionLabel = "Expiring product in Zuora…";
+    }
+
+    addAssistantMessage(executionLabel);
+
     try {
-      // 🔹 1) Decide which body to send: edited JSON (apiPayloadText) or fallback to zuoraGeneratedBody
-      let effectiveBody: any = zuoraGeneratedBody;
-  
-      if (apiPayloadText) {
-        try {
-          const parsed = JSON.parse(apiPayloadText);
-          effectiveBody = parsed;
-          // keep state in sync with the edited payload
-          setZuoraGeneratedBody(parsed);
-        } catch (e) {
-          setToastMessage(
-            "Payload JSON is invalid. Please fix it before creating."
+      // ---------------------------------------------------
+      // 0️⃣ DIRECT REST MODE — use zuora_api_payloads as-is
+      // ---------------------------------------------------
+      const safeConvId =
+        sanitizeConvId(conversationId) ??
+        getOrCreateConversationId(CHAT_PERSONA);
+
+      const convPayloads: ZuoraPayloadItem[] =
+        conversationPayloads[safeConvId] || [];
+
+      const hasDirectRestPayloads = convPayloads.some(
+        (item) =>
+          item &&
+          item.payload &&
+          typeof item.payload === "object" &&
+          "method" in item.payload &&
+          "endpoint" in item.payload
+      );
+
+      if (hasDirectRestPayloads) {
+        const convPayloads = conversationPayloads[safeConvId] || [];
+
+        const hasDirectRestPayloads = convPayloads.some(
+          (item) =>
+            item &&
+            item.payload &&
+            typeof item.payload === "object" &&
+            "method" in item.payload &&
+            "endpoint" in item.payload
+        );
+
+        if (hasDirectRestPayloads) {
+          const payload = {
+            clientId,
+            clientSecret,
+            // ✅ send raw zuora_api_payloads to Lambda
+            zuora_api_payloads: convPayloads,
+          };
+
+          console.log("🔥 EXECUTING DIRECT ZUORA API PAYLOADS →");
+          console.log(JSON.stringify(payload, null, 2));
+
+          const res = await fetch(
+            "https://7ajwemkf19.execute-api.us-east-2.amazonaws.com/demo/zuora/product",
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(payload),
+            }
           );
-          addAssistantMessage(
-            "Your edited payload is not valid JSON. Please correct it in the preview panel and try again."
-          );
-          setExecuting(false);
-          return;
+
+          const raw = await res.text();
+          let data: any = {};
+          try {
+            data = JSON.parse(raw);
+          } catch {
+            throw new Error("Invalid JSON response from Lambda.");
+          }
+
+          console.log("🔍 LAMBDA RESPONSE (DIRECT MODE):", data);
+
+          // 🔎 NEW: detect errors in mode === "zuora_api_payloads"
+          let resultFailure = false;
+          if (
+            data.mode === "zuora_api_payloads" &&
+            Array.isArray(data.results)
+          ) {
+            resultFailure = data.results.some(
+              (r: any) =>
+                r?.success === false ||
+                r?.response?.Success === false ||
+                r?.response?.Errors
+            );
+          }
+
+          const isFailure =
+            data.error ||
+            data.Error ||
+            data.Errors ||
+            data.success === false ||
+            data.Success === false ||
+            resultFailure ||
+            res.status >= 400;
+
+          if (isFailure) {
+            let resultError: string | undefined;
+
+            if (
+              data.mode === "zuora_api_payloads" &&
+              Array.isArray(data.results)
+            ) {
+              const failed = data.results.find(
+                (r: any) =>
+                  r?.success === false ||
+                  r?.response?.Success === false ||
+                  r?.response?.Errors
+              );
+              if (failed?.response?.Errors) {
+                resultError = JSON.stringify(failed.response.Errors);
+              }
+            }
+
+            const errMsg =
+              data.error ||
+              data.Error ||
+              JSON.stringify(data.Errors) ||
+              resultError ||
+              "Zuora request failed.";
+
+            setToastMessage({
+              message: errMsg,
+              type: "error",
+            });
+
+            addAssistantMessage(`❌ ${errMsg}`);
+            throw new Error(errMsg);
+          }
+
+          const successMessage =
+            data.message || "Zuora operation completed successfully.";
+
+          setToastMessage({
+            message: successMessage,
+            type: "success",
+          });
+
+          addAssistantMessage(`✅ ${successMessage}`);
+
+          // 🌟 NEW: extract IDs from zuora_api_payloads-style responses
+          let productId: string | undefined = data.productId;
+          let ratePlanIds: string[] = data.ratePlanIds || [];
+          let chargeIds: string[] = data.chargeIds || [];
+
+          if (
+            data.mode === "zuora_api_payloads" &&
+            Array.isArray(data.results)
+          ) {
+            const results = data.results as any[];
+
+            const productResult = results.find((r) =>
+              String(r.zuora_api_type || r.name || "")
+                .toLowerCase()
+                .includes("product")
+            );
+            const ratePlanResults = results.filter((r) =>
+              String(r.zuora_api_type || r.name || "")
+                .toLowerCase()
+                .includes("rateplan")
+            );
+            const chargeResults = results.filter((r) =>
+              String(r.zuora_api_type || r.name || "")
+                .toLowerCase()
+                .includes("charge")
+            );
+
+            const getId = (r: any) =>
+              r?.response?.Id || r?.response?.id || r?.response?.ProductId;
+
+            const extractedProductId = productResult && getId(productResult);
+            if (extractedProductId) {
+              productId = extractedProductId;
+            }
+
+            ratePlanIds = ratePlanResults
+              .map(getId)
+              .filter((x): x is string => !!x);
+            chargeIds = chargeResults
+              .map(getId)
+              .filter((x): x is string => !!x);
+          }
+
+          // 👇 this feeds productConsoleLink → "Open product in Zuora"
+          setExecutionResult({
+            productId: productId || "",
+            ratePlanIds,
+            chargeIds,
+          });
+
+          return; // ✅ skip classic create flow
         }
       }
-  
-      if (!effectiveBody) {
-        setToastMessage("No generated Zuora body found.");
-        addAssistantMessage("I could not find the generated product payload.");
-        setExecuting(false);
-        return;
+
+      // ---------------------------------------------------
+      // 1️⃣ CLASSIC CREATE PRODUCT FLOW (3-step workspace)
+      // ---------------------------------------------------
+      let productPayload: any = null;
+      let ratePlanPayload: any = null;
+      let ratePlanChargePayload: any = null;
+
+      // DYNAMIC MODE — use edited workspace steps
+      if (zuoraSteps.length > 0) {
+        const updatedSteps = zuoraSteps.map((s) => ({ ...s }));
+        const parsedSteps: { type: string; payload: any }[] = [];
+        let hasError = false;
+
+        updatedSteps.forEach((step) => {
+          if (!step.json || !step.json.trim()) {
+            step.error = "Payload is empty. Please provide valid JSON.";
+            hasError = true;
+            return;
+          }
+
+          try {
+            const parsed = JSON.parse(step.json);
+
+            // 🔴 re-inject dynamic fields that we hid in the UI
+            if (
+              step.hiddenFields &&
+              Object.keys(step.hiddenFields).length > 0
+            ) {
+              for (const [k, v] of Object.entries(step.hiddenFields)) {
+                // only overwrite if user didn't explicitly set something different
+                if (
+                  parsed[k] === undefined ||
+                  parsed[k] === null ||
+                  parsed[k] === "" ||
+                  (typeof parsed[k] === "string" &&
+                    parsed[k].startsWith("<auto-linked"))
+                ) {
+                  parsed[k] = v;
+                }
+              }
+            }
+
+            step.error = null;
+            parsedSteps.push({ type: step.type, payload: parsed });
+          } catch (err: any) {
+            step.error = err.message || "Invalid JSON";
+            hasError = true;
+          }
+        });
+
+        setZuoraSteps(updatedSteps);
+
+        if (hasError) {
+          throw new Error(
+            "One or more steps contain invalid JSON. Fix them before executing."
+          );
+        }
+
+        productPayload =
+          parsedSteps.find((s) => s.type === "product")?.payload || null;
+        ratePlanPayload =
+          parsedSteps.find((s) => s.type === "rateplan")?.payload || null;
+
+        const chargePayloads = parsedSteps
+          .filter((s) => s.type === "rateplancharge")
+          .map((s) => s.payload);
+
+        ratePlanChargePayload =
+          chargePayloads.length > 0 ? chargePayloads : null;
+
+        setPreparedPayloads({
+          step1: productPayload,
+          step2: ratePlanPayload,
+          step3: ratePlanChargePayload,
+        });
       }
-  
+
+      // FALLBACK MODE — old textareas
+      else {
+        let step1Obj: any = null;
+        let step2Obj: any = null;
+        let step3Obj: any = null;
+
+        try {
+          step1Obj = JSON.parse(step1ProductJson || "{}");
+          setStep1Error(null);
+        } catch (e: any) {
+          setStep1Error(e.message);
+          throw new Error(`Step 1 JSON invalid: ${e.message}`);
+        }
+
+        try {
+          step2Obj = JSON.parse(step2RatePlanJson || "{}");
+          setStep2Error(null);
+        } catch (e: any) {
+          setStep2Error(e.message);
+          throw new Error(`Step 2 JSON invalid: ${e.message}`);
+        }
+
+        if (step3ChargeJson.trim()) {
+          try {
+            step3Obj = JSON.parse(step3ChargeJson);
+            setStep3Error(null);
+          } catch (e: any) {
+            setStep3Error(e.message);
+            throw new Error(`Step 3 JSON invalid: ${e.message}`);
+          }
+        } else {
+          step3Obj = null;
+        }
+
+        productPayload = step1Obj;
+        ratePlanPayload = step2Obj;
+        ratePlanChargePayload = step3Obj;
+
+        setPreparedPayloads({
+          step1: step1Obj,
+          step2: step2Obj,
+          step3: step3Obj,
+        });
+      }
+
+      // PRODUCT MANDATORY
+      if (!productPayload) {
+        throw new Error(
+          "No product payload found. Please review the steps before executing."
+        );
+      }
+
       const payload = {
         clientId,
         clientSecret,
-        body: effectiveBody, // 🔥 uses edited JSON if present
+        body: {
+          product: productPayload,
+          ratePlan: ratePlanPayload,
+          ratePlanCharge: ratePlanChargePayload,
+        },
       };
-  
-      console.log("🔥 FINAL PAYLOAD SENT TO ZUORA:");
+
+      console.log("🔥 FINAL PAYLOAD SENT TO ZUORA LAMBDA →");
       console.log(JSON.stringify(payload, null, 2));
-  
+
       const res = await fetch(
         "https://7ajwemkf19.execute-api.us-east-2.amazonaws.com/demo/zuora/product",
         {
@@ -1681,68 +2350,154 @@ export default function WorkflowPage() {
           body: JSON.stringify(payload),
         }
       );
-  
+
       const raw = await res.text();
       let data: any = {};
       try {
         data = JSON.parse(raw);
       } catch {
-        /* ignore parse errors, fall back on raw */
+        throw new Error("Invalid JSON response from Lambda.");
       }
-  
-      if (!res.ok) {
-        throw new Error(data?.error || data?.message || `${res.status}`);
+
+      console.log("🔍 LAMBDA RESPONSE:", data);
+
+      const isFailure =
+        data.error ||
+        data.Error ||
+        data.Errors ||
+        data.success === false ||
+        data.Success === false ||
+        res.status >= 400;
+
+      if (isFailure) {
+        const errMsg =
+          data.error ||
+          data.Error ||
+          JSON.stringify(data.Errors) ||
+          "Zuora request failed.";
+
+        setToastMessage({
+          message: errMsg,
+          type: "error",
+        });
+
+        addAssistantMessage(`❌ ${errMsg}`);
+        throw new Error(errMsg);
       }
-  
-      // ---- map API response → IDs (same as before) ----
-      const productId: string | undefined =
-        data.productId || data.Id || data.id;
-  
-      const ratePlanIds: string[] = Array.isArray(data.ratePlans)
-        ? data.ratePlans
-            .map((rp: any) => rp.Id || rp.id)
-            .filter(Boolean)
-        : [];
-  
-      const chargeIds: string[] = Array.isArray(data.charges)
-        ? data.charges
-            .map((ch: any) => ch.Id || ch.id)
-            .filter(Boolean)
-        : [];
-  
-      setExecutionResult({
-        productId: productId ?? "",
-        ratePlanIds,
-        chargeIds,
+
+      const successMessage =
+        data.message || "Product + RatePlan + Charges created!";
+
+      setToastMessage({
+        message: successMessage,
+        type: "success",
       });
-  
-      let msg =
-        data.message ||
-        "✅ Product + RatePlans + Charges created successfully!";
-  
-      if (productId) {
-        msg += `\n\nProduct Id: ${productId}`;
-      }
-      if (ratePlanIds.length) {
-        msg += `\nRatePlan Ids:\n- ${ratePlanIds.join("\n- ")}`;
-      }
-      if (chargeIds.length) {
-        msg += `\nCharge Ids:\n- ${chargeIds.join("\n- ")}`;
-      }
-  
-      addAssistantMessage(msg);
-      setToastMessage(data.message || "Product created successfully!");
+
+      addAssistantMessage(`✅ ${successMessage}`);
+
+      setExecutionResult({
+        productId: data.productId,
+        ratePlanIds: data.ratePlanIds || [],
+        chargeIds: data.chargeIds || [],
+      });
     } catch (err: any) {
-      console.error("Create product error:", err);
-      addAssistantMessage("❌ Product creation failed.");
-      setToastMessage(err.message ?? "Product creation failed");
+      setToastMessage({
+        message: err.message || "Execution failed",
+        type: "error",
+      });
     } finally {
       setExecuting(false);
+      setIsExecuting(false);
     }
   };
 
-  
-  
+  const handleRefreshConversation = () => {
+    // 1️⃣ Create a brand-new conversation ID
+    const freshId = newConversationId();
+
+    // 2️⃣ Save to React state
+    setConversationId(freshId);
+    setActiveConversationId(freshId);
+
+    // 3️⃣ Save to sessionStorage (PERSONA-scoped)
+    if (typeof window !== "undefined") {
+      const key = storageKeyForPersona(CHAT_PERSONA);
+      sessionStorage.setItem(key, freshId);
+    }
+
+    // 4️⃣ Insert empty conversation into left sidebar
+    const nowIso = new Date().toISOString();
+    setConversations((prev) => [
+      {
+        id: freshId,
+        title: "New chat",
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      },
+      ...prev,
+    ]);
+
+    // 5️⃣ Reset chat messages to default
+    setChatMessages([
+      {
+        role: "assistant",
+        content:
+          "Hi, I'm Zia — your AI  Architect. Let's connect to Zuora and manage your Product Catalog.",
+        timestamp: new Date(),
+      },
+    ]);
+
+    // 6️⃣ Reset all workspace flows
+    setCurrentFlow("idle");
+    setCreateProductStep("name");
+    setUpdateProductStep("identify");
+    setExpireProductStep("identify");
+    setViewProductStep("choose-scope");
+
+    // Reset product data
+    setProductData({
+      name: "",
+      sku: "",
+      description: "",
+      startDate: "",
+      ratePlans: [],
+    });
+    setCurrentRatePlan({ name: "", description: "", charges: [] });
+    setSelectedProduct(null);
+    setSelectedAttribute("");
+    setNewAttributeValue("");
+    setExpireMethod("");
+    setExpireDate("");
+    setViewScope("specific");
+    setViewDetailType("");
+
+    // Reset UI payload workspace
+    setZuoraSteps([]);
+    setShowPayload(false);
+    setPreparedPayloads({ step1: null, step2: null, step3: null });
+    setExecutionResult(null);
+
+    // 7️⃣ DO NOT REMOVE conversation-specific Zuora payloads
+    // (you already removed this, so nothing here)
+
+    setToastMessage({
+      type: "success",
+      message: "Conversation reset — new chat started.",
+    });
+  };
+
+  const resetZuoraApiPayloadForChat = (convId: string) => {
+    setConversationPayloads((prev) => {
+      const updated = { ...prev };
+      delete updated[convId]; // Remove payloads for THIS chat only
+      return updated;
+    });
+
+    // Also remove from localStorage (if you persist it)
+    const saved = JSON.parse(localStorage.getItem("pm_chat_payloads") || "{}");
+    delete saved[convId];
+    localStorage.setItem("pm_chat_payloads", JSON.stringify(saved));
+  };
 
   const generateProductPayload = () => {
     const payload = {
@@ -1802,7 +2557,7 @@ export default function WorkflowPage() {
       {
         role: "assistant",
         content:
-          "Hi, I'm Zia — your AI configuration assistant. Let's connect to Zuora and manage your Product Catalog.",
+          "Hi, I'm Zia — your AI  Architect. Let's connect to Zuora and manage your Product Catalog.",
         timestamp: new Date(),
       },
     ]);
@@ -1830,6 +2585,8 @@ export default function WorkflowPage() {
     setViewDetailType("");
     setValidationResults([]);
     setExecutionResult(null);
+    setShowPayload(false);
+    setPreparedPayloads({ step1: null, step2: null, step3: null });
   };
 
   const toggleFlowExpansion = (flowId: string) => {
@@ -1862,98 +2619,12 @@ export default function WorkflowPage() {
   ];
 
   const activeConversation =
-  conversations.find((c) => c.id === activeConversationId) || null;
+    conversations.find((c) => c.id === activeConversationId) || null;
 
-const activeChatTitle = activeConversation?.title || "New chat";
-
-
-
-const mapZuoraPayloadsToCreateBody = (
-  items: ZuoraPayloadItem[]
-) => {
-  const productItem = items.find(
-    (p) => p.zuora_api_type?.toLowerCase() === "product"
-  );
-  const product = productItem?.payload ?? {};
-
-  const ratePlans = items
-    .filter((p) => p.zuora_api_type?.toLowerCase() === "rateplan")
-    .map((rp) => {
-      const p = rp.payload || {};
-      return {
-        name: p.name ?? p.Name ?? "",
-        chargeModel:
-          p.chargeModel ??
-          p.ChargeModel ??
-          (p.charge_type === "usage" ? "usage" : "recurring"),
-        chargeType: p.chargeType ?? p.ChargeType ?? "",
-        price: p.price ?? p.Price,
-        billingCycle: p.billingCycle ?? p.BillingPeriod,
-        billingRule: p.billingRule ?? p.BillingTiming,
-        unitOfMeasure:
-          p.unitOfMeasure ?? p.UnitOfMeasure ?? p.unit_of_measure ?? "",
-        includedUnits: p.includedUnits ?? p.IncludedUnits,
-        overagePrice: p.overagePrice ?? p.OveragePrice,
-        overageEnabled:
-          p.overageEnabled ?? p.OverageEnabled ?? p.overage_enabled,
-      };
-    });
-
-  return {
-    name: product.name ?? product.Name ?? "",
-    productCode:
-      product.productCode ??
-      product.ProductCode ??
-      product.SKU ??
-      product.sku ??
-      "",
-    description: product.description ?? product.Description ?? "",
-    effectiveStartDate:
-      product.effectiveStartDate ??
-      product.EffectiveStartDate ??
-      product.startDate ??
-      "",
-    effectiveEndDate:
-      product.effectiveEndDate ??
-      product.EffectiveEndDate ??
-      "2099-12-31",
-    currencies:
-      product.currencies ??
-      product.Currencies ??
-      (product.currency ? [product.currency] : []),
-    ratePlans,
-  };
-};
-
-const handleCopyPayload = async () => {
-  // Prefer AI-generated preview payload, fallback to local generator
-  const text = apiPayloadText ?? generateProductPayload();
-
-  try {
-    setCopying(true);
-    if (navigator?.clipboard?.writeText) {
-      await navigator.clipboard.writeText(text);
-    } else {
-      const ta = document.createElement("textarea");
-      ta.value = text;
-      ta.style.position = "fixed";
-      ta.style.opacity = "0";
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand("copy");
-      document.body.removeChild(ta);
-    }
-    setToastMessage("Copied payload to clipboard");
-  } catch (e) {
-    setToastMessage("Copy failed. Select and copy manually.");
-  } finally {
-    setCopying(false);
-  }
-};
-
+  const activeChatTitle = activeConversation?.title || "New chat";
 
   return (
-    <div className="flex min-h-screen flex-col bg-gray-50">
+    <div className="flex h-[100vh] flex-col bg-gray-50">
       <header className="border-b border-gray-200 bg-slate-800 text-white">
         <div className="flex h-14 items-center justify-between px-6">
           <div className="flex items-center gap-6">
@@ -1961,7 +2632,7 @@ const handleCopyPayload = async () => {
               variant="ghost"
               size="icon"
               className="text-gray-300 hover:text-white"
-              onClick={() => router.push("/")}
+              onClick={handleHomeClick}
               aria-label="Home"
             >
               <Home className="h-5 w-5" />
@@ -2027,59 +2698,58 @@ const handleCopyPayload = async () => {
           </div>
         </div>
       </header>
+
       {/* Page Title */}
       <div className="mb-1 bg-white/70 backdrop-blur supports-[backdrop-filter]:bg-white/60">
-        <div className="mx-auto flex h-14 max-w-7xl items-center px-6">
+        <div className="flex h-14 max-w-7xl items-center px-6">
           <h1 className="text-base font-semibold text-gray-900">
-            Architect 
+            Architect
           </h1>
         </div>
       </div>
-
       <div className="flex flex-1 overflow-hidden min-h-0">
-        {/* NEW: Chat history sidebar */}
+        {/* Chat history sidebar */}
         <ChatHistorySidebar
-          conversations={conversations}
+          conversations={sortedConversations}
           activeConversationId={activeConversationId}
           onNewConversation={handleNewConversation}
           onSelectConversation={handleSelectConversation}
+          onDeleteConversation={handleDeleteConversation}
+          onStartAction={startActionWithChat}
+          sortOrder={chatSortOrder}
+          onToggleSort={() =>
+            setChatSortOrder((prev) => (prev === "desc" ? "asc" : "desc"))
+          }
         />
 
         {/* Left Panel - Chat Assistant */}
         <div
-          className="flex w-[38%] flex-col border-r border-gray-200
+          className="flex w-[44%]  pt-[60px] flex-col border-r border-gray-200
                   bg-gradient-to-b from-[#F9FAFB] to-white min-h-0"
-          style={{ height: "87vh" }}
+          style={{ height: "95vh" }}
         >
-<div className="border-b border-gray-200 p-6">
-  <div className="flex items-center justify-between">
-    <div className="flex flex-col">
-      <h2 className="max-w-xs truncate text-sm font-semibold text-gray-900">
-        {activeChatTitle}
-      </h2>
-      <span className="text-xs text-gray-500">Chat Assistant</span>
-    </div>
-    <Button
-      variant="ghost"
-      size="sm"
-      className="text-gray-600 hover:text-gray-900"
-      onClick={() => {
-        setChatMessages([
-          {
-            role: "assistant",
-            content:
-              "Hi, I'm Zia — your AI configuration assistant. Let's connect to Zuora and manage your Product Catalog.",
-            timestamp: new Date(),
-          },
-        ]);
-        setCurrentFlow("idle");
-        setCompletedFlows([]);
-      }}
-    >
-      <RotateCcw className="h-4 w-4" />
-    </Button>
-  </div>
-</div>
+          <div className="border-b border-gray-200 p-6">
+            <div className="flex items-center justify-between">
+              <div className="flex flex-col">
+                <h2 className="max-w-xs truncate text-sm font-semibold text-gray-900">
+                  {activeChatTitle}
+                </h2>
+                <span className="text-xs text-gray-500">
+                  Disclaimer: Content produced by this application are generated
+                  through AI. Outputs are intended to be accurate, but minor
+                  variations may appear. Review content prior to application.
+                </span>
+              </div>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="text-gray-600 hover:text-gray-900"
+                onClick={handleRefreshConversation}
+              >
+                <RotateCcw className="h-4 w-4 cursor-pointer text-gray-500 hover:text-gray-700" />
+              </Button>
+            </div>
+          </div>
 
           <div
             ref={chatContainerRef}
@@ -2090,30 +2760,81 @@ const handleCopyPayload = async () => {
               {completedFlows.map((flow) => (
                 <Card key={flow.id} className="border-green-200 bg-green-50">
                   <CardHeader
-                    className="cursor-pointer p-4"
-                    onClick={() => toggleFlowExpansion(flow.id)}
+                    onClick={() =>
+                      setZuoraSteps((prev) =>
+                        prev.map((s) =>
+                          s.id === step.id ? { ...s, expanded: !s.expanded } : s
+                        )
+                      )
+                    }
+                    className="cursor-pointer"
                   >
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-2">
-                        <CheckCircle2 className="h-5 w-5 text-green-600" />
-                        <div>
-                          <CardTitle className="text-sm font-semibold text-green-900">
-                            {flow.title}
-                          </CardTitle>
-                          {flow.summary && (
-                            <p className="text-xs text-green-700">
-                              {flow.summary}
-                            </p>
-                          )}
-                        </div>
+                    <div className="flex justify-between gap-3">
+                      {/* left: title + description */}
+                      <div className="space-y-1 min-w-0">
+                        <CardTitle className="text-base font-semibold">
+                          {step.title || `Step ${index + 1}`}
+                        </CardTitle>
+                        <CardDescription className="text-sm text-muted-foreground">
+                          {step.description}
+                        </CardDescription>
                       </div>
-                      <ChevronDown
-                        className={`h-4 w-4 text-green-600 transition-transform ${
-                          flow.isExpanded ? "rotate-180" : ""
-                        }`}
-                      />
+
+                      {/* right: copy icon + chevron, aligned at end */}
+                      <div className="flex items-center gap-2 shrink-0">
+                        <Button
+                          size="icon"
+                          variant="outline"
+                          className="h-8 w-8"
+                          onClick={async (e) => {
+                            e.stopPropagation(); // don't toggle expand
+                            try {
+                              await navigator.clipboard.writeText(step.json);
+                              setToastMessage({
+                                message: `Copied ${
+                                  step.title || `Step ${index + 1}`
+                                } payload`,
+                                type: "success",
+                              });
+                            } catch {
+                              setToastMessage({
+                                message: "Copy failed. Please copy manually.",
+                                type: "error",
+                              });
+                            }
+                          }}
+                        >
+                          {/* your copy SVG/icon */}
+                          <svg
+                            className="w-4 h-4"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            strokeWidth="1.5"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                          >
+                            <rect
+                              x="9"
+                              y="9"
+                              width="13"
+                              height="13"
+                              rx="2"
+                              ry="2"
+                            />
+                            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                          </svg>
+                        </Button>
+
+                        <ChevronDown
+                          className={`h-4 w-4 transition-transform ${
+                            step.expanded ? "rotate-180" : ""
+                          }`}
+                        />
+                      </div>
                     </div>
                   </CardHeader>
+
                   {flow.isExpanded && (
                     <CardContent className="space-y-3 border-t border-green-200 p-4">
                       {flow.messages.map((message, index) => (
@@ -2129,44 +2850,110 @@ const handleCopyPayload = async () => {
                 </Card>
               ))}
 
-              {chatMessages.map((message, index) => (
-                <div key={index}>
-                  {index > 0 && <div className="my-4 h-px bg-gray-100" />}
-                  <div className="flex gap-3">
-                    {message.role === "assistant" && (
-                      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-blue-100">
-                        <Sparkles className="h-4 w-4 text-[#2B6CF3]" />
-                      </div>
-                    )}
-                    <div className="flex-1">
+              <div className="flex flex-col flex-1 overflow-y-auto space-y-4 px-4 py-6">
+                {chatMessages.map((message, index) => {
+                  const isUser = message.role === "user";
+                  const isApiAssistant =
+                    message.role === "assistant" && message.fromApi;
+                  return (
+                    <div
+                      key={index}
+                      className={`flex w-full ${
+                        isUser ? "justify-end" : "justify-start"
+                      }`}
+                    >
                       <div
-                        className={`rounded-lg p-4 ${
-                          message.role === "assistant"
-                            ? "rounded-tl-none bg-gray-100"
-                            : "ml-auto max-w-[80%] rounded-tr-none bg-[#2B6CF3] text-white"
+                        className={`max-w-[80%] p-3 rounded-lg shadow-sm border ${
+                          isUser
+                            ? "bg-blue-600 text-white border-blue-700"
+                            : "bg-gray-50 text-gray-800 border-gray-200 dark:bg-gray-800 dark:border-gray-700"
                         }`}
                       >
-                        <p className="whitespace-pre-line text-sm">
-                          {message.content}
-                        </p>
+                        {/* USER MESSAGE */}
+                        {isUser && (
+                          <div className="whitespace-pre-wrap text-sm">
+                            {message.content}
+                          </div>
+                        )}
+
+                        {/* ASSISTANT MESSAGE (HTML) */}
+                        {!isUser && (
+                          <div
+                            className="prose prose-sm max-w-full dark:prose-invert break-words
+                                     [&_table]:block [&_table]:w-full [&_table]:overflow-x-auto
+         [&_th]:whitespace-nowrap [&_td]:whitespace-nowrap"
+                            dangerouslySetInnerHTML={{
+                              __html: message.content,
+                            }}
+                          />
+                        )}
+
+                        {/* TIMESTAMP */}
+                        <div className="text-xs text-gray-500 mt-2 text-right">
+                          {new Date(message.timestamp).toLocaleTimeString([], {
+                            hour: "2-digit",
+                            minute: "2-digit",
+                          })}
+                        </div>
+
+                        {/* COPY BUTTON – only for LLM replies coming from the chat API */}
+                        {isApiAssistant && (
+                          <button
+                            className="mt-2 text-xs text-blue-600 hover:underline flex items-center gap-1"
+                            onClick={() => {
+                              navigator.clipboard.writeText(
+                                typeof message.content === "string"
+                                  ? message.content.replace(/<[^>]*>?/gm, "")
+                                  : ""
+                              );
+                              setToastMessage({
+                                message: `Copied message`,
+                                type: "success",
+                              });
+                            }}
+                          >
+                            <svg
+                              className="w-4 h-4"
+                              fill="none"
+                              stroke="currentColor"
+                              strokeWidth="1.5"
+                              viewBox="0 0 24 24"
+                            >
+                              <path
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                                d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 6h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"
+                              />
+                            </svg>
+                          </button>
+                        )}
                       </div>
-                      <p className="mt-1 text-xs text-[#9CA3AF]">
-                        {message.timestamp.toLocaleTimeString([], {
-                          hour: "2-digit",
-                          minute: "2-digit",
-                        })}
-                      </p>
                     </div>
-                    {message.role === "user" && (
-                      <div className="h-8 w-8 shrink-0" />
-                    )}
-                  </div>
+                  );
+                })}
+              </div>
+
+              {productConsoleLink && (
+                <div className="mt-2 flex">
+                  <Button
+                    asChild
+                    size="sm"
+                    variant="outline"
+                    className="mt-1 rounded-full border-[#2B6CF3] text-[#2B6CF3] hover:bg-blue-50"
+                  >
+                    <a
+                      href={productConsoleLink}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      Open product in Zuora
+                    </a>
+                  </Button>
                 </div>
-              ))}
+              )}
 
               {isTyping && <TypingIndicator />}
 
-              {/* bottom anchor for smooth scroll */}
               <div ref={chatBottomRef} />
 
               {currentFlow === "create-product" &&
@@ -2239,7 +3026,7 @@ const handleCopyPayload = async () => {
                           onClick={handleGeneratePayload}
                         >
                           <FileCode className="mr-2 h-4 w-4" />
-                          Preview Payloads
+                          Preview Payloads (3 steps)
                         </Button>
                         <Button
                           className="w-full bg-transparent"
@@ -2299,225 +3086,9 @@ const handleCopyPayload = async () => {
                   </Card>
                 )}
 
-              {/* Update Product Flow UI */}
-              {currentFlow === "update-product" &&
-                updateProductStep === "show-summary" &&
-                selectedProduct && (
-                  <Card className="border-blue-100 bg-blue-50">
-                    <CardContent className="space-y-3 text-sm">
-                      <div className="flex items-center gap-2">
-                        <AlertTriangle className="h-5 w-5 text-blue-600" />
-                        <h3 className="font-medium text-blue-900">
-                          Product Found
-                        </h3>
-                      </div>
-                      <div>
-                        <span className="font-medium">Product Name:</span>{" "}
-                        {selectedProduct.name}
-                      </div>
-                      <div>
-                        <span className="font-medium">SKU:</span>{" "}
-                        {selectedProduct.sku}
-                      </div>
-                      <div>
-                        <span className="font-medium">Description:</span>{" "}
-                        {selectedProduct.description}
-                      </div>
-                      <div>
-                        <span className="font-medium">Effective Start:</span>{" "}
-                        {selectedProduct.effectiveStart}
-                      </div>
-                      <div>
-                        <span className="font-medium">Effective End:</span>{" "}
-                        {selectedProduct.effectiveEnd}
-                      </div>
-                      <div>
-                        <span className="font-medium">Currency:</span>{" "}
-                        {selectedProduct.currency}
-                      </div>
-                    </CardContent>
-                  </Card>
-                )}
+              {currentFlow === "idle" && !showPayload && <div> </div>}
 
-              {currentFlow === "update-product" &&
-                updateProductStep === "confirm" &&
-                selectedProduct && (
-                  <Card className="border-orange-100 bg-orange-50">
-                    <CardContent className="space-y-3 text-sm">
-                      <div className="flex items-center gap-2">
-                        <AlertTriangle className="h-5 w-5 text-orange-600" />
-                        <h3 className="font-medium text-orange-900">
-                          Confirm Update
-                        </h3>
-                      </div>
-                      <div className="text-xs text-orange-800">
-                        ⚠️ Note: This change will be effective for new
-                        subscriptions only.
-                      </div>
-                      <div>
-                        <span className="font-medium">Product:</span>{" "}
-                        {selectedProduct.description}
-                      </div>
-                      <div>
-                        <span className="font-medium">Change:</span>{" "}
-                        {selectedAttribute} → {newAttributeValue}
-                      </div>
-                      <p>Do you want me to proceed with this update?</p>
-                    </CardContent>
-                  </Card>
-                )}
-
-              {/* Expire Product Flow UI */}
-              {currentFlow === "expire-product" &&
-                expireProductStep === "show-details" &&
-                selectedProduct && (
-                  <Card className="border-orange-100 bg-orange-50">
-                    <CardContent className="space-y-3 text-sm">
-                      <div className="flex items-center gap-2">
-                        <AlertTriangle className="h-5 w-5 text-orange-600" />
-                        <h3 className="font-medium text-orange-900">
-                          Product Found
-                        </h3>
-                      </div>
-                      <div>
-                        <span className="font-medium">Product Name:</span>{" "}
-                        {selectedProduct.name}
-                      </div>
-                      <div>
-                        <span className="font-medium">SKU:</span>{" "}
-                        {selectedProduct.sku}
-                      </div>
-                      <div>
-                        <span className="font-medium">Effective Start:</span>{" "}
-                        {selectedProduct.effectiveStart}
-                      </div>
-                      <div>
-                        <span className="font-medium">Effective End:</span>{" "}
-                        {selectedProduct.effectiveEnd}
-                      </div>
-                      <p className="mt-3">
-                        Would you like to change its End Date to expire it?
-                      </p>
-                    </CardContent>
-                  </Card>
-                )}
-
-              {currentFlow === "expire-product" &&
-                expireProductStep === "dependency-check" &&
-                selectedProduct && (
-                  <Card className="border-green-100 bg-green-50">
-                    <CardContent className="space-y-3 text-sm">
-                      <div className="flex items-center gap-2">
-                        <CheckCircle2 className="h-5 w-5 text-green-600" />
-                        <h3 className="font-medium text-green-900">
-                          Expiration Settings
-                        </h3>
-                      </div>
-                      <div>
-                        <span className="font-medium">Product:</span>{" "}
-                        {selectedProduct.description}
-                      </div>
-                      <div>
-                        <span className="font-medium">
-                          New Effective End Date:
-                        </span>{" "}
-                        {expireDate}
-                      </div>
-                      <p className="mt-3">
-                        Before expiring the product, I'll check if there are any
-                        active or future-dated rate plans linked to it. Continue
-                        even if active rate plans exist?
-                      </p>
-                    </CardContent>
-                  </Card>
-                )}
-
-              {currentFlow === "expire-product" &&
-                expireProductStep === "confirm" &&
-                selectedProduct && (
-                  <Card className="border-blue-100 bg-blue-50">
-                    <CardContent className="space-y-3 text-sm">
-                      <div className="flex items-center gap-2">
-                        <AlertCircle className="h-5 w-5 text-blue-600" />
-                        <h3 className="font-medium text-blue-900">
-                          Confirm Expiration
-                        </h3>
-                      </div>
-                      <div>
-                        <span className="font-medium">Product:</span>{" "}
-                        {selectedProduct.description}
-                      </div>
-                      <div>
-                        <span className="font-medium">
-                          New Effective End Date:
-                        </span>{" "}
-                        {expireDate}
-                      </div>
-                      <p className="mt-3">Do you confirm this update?</p>
-                    </CardContent>
-                  </Card>
-                )}
-
-              {/* View Product Flow UI */}
-              {currentFlow === "view-product" &&
-                viewProductStep === "show-summary" &&
-                selectedProduct && (
-                  <Card className="border-cyan-100 bg-cyan-50">
-                    <CardContent className="space-y-3 text-sm">
-                      <div className="flex items-center gap-2">
-                        <Eye className="h-5 w-5 text-cyan-600" />
-                        <h3 className="font-medium text-cyan-900">
-                          Product Details
-                        </h3>
-                      </div>
-                      <div>
-                        <span className="font-medium">Product ID:</span>{" "}
-                        {selectedProduct.id}
-                      </div>
-                      <div>
-                        <span className="font-medium">SKU:</span>{" "}
-                        {selectedProduct.sku}
-                      </div>
-                      <div>
-                        <span className="font-medium">Effective Start:</span>{" "}
-                        {selectedProduct.effectiveStart}
-                      </div>
-                      <div>
-                        <span className="font-medium">Effective End:</span>{" "}
-                        {selectedProduct.effectiveEnd}
-                      </div>
-                      <div>
-                        <span className="font-medium">Org Units:</span>{" "}
-                        {selectedProduct.orgUnits}
-                      </div>
-                      <p className="mt-3">
-                        Would you like to view more details?
-                      </p>
-                    </CardContent>
-                  </Card>
-                )}
-
-              {currentFlow === "view-product" &&
-                viewProductStep === "show-detail" &&
-                selectedProduct && (
-                  <Card className="border-purple-100 bg-purple-50">
-                    <CardContent className="space-y-3 text-sm">
-                      <div className="flex items-center gap-2">
-                        <BookOpen className="h-5 w-5 text-purple-600" />
-                        <h3 className="font-medium text-purple-900">
-                          {viewDetailType === "Rate Plans & Charges"
-                            ? "Rate Plans"
-                            : viewDetailType}
-                        </h3>
-                      </div>
-                      <p>Would you like to view another detail type?</p>
-                    </CardContent>
-                  </Card>
-                )}
-
-          
-
-              {showNewMessagesPill && (
+              {/* {showNewMessagesPill && (
                 <button
                   onClick={() => scrollToBottom(true)}
                   className="absolute bottom-4 right-4 z-10 flex items-center gap-2 rounded-full bg-[#2B6CF3] px-4 py-2 text-sm font-medium text-white shadow-lg"
@@ -2525,46 +3096,55 @@ const handleCopyPayload = async () => {
                   <span>New messages</span>
                   <ChevronDown className="h-4 w-4" />
                 </button>
-              )}
+              )} */}
             </div>
           </div>
 
           <div className="sticky bottom-0 border-t border-gray-200 bg-white p-4">
-  <div className="relative">
-    <Input
-      ref={chatInputRef}
-      placeholder="Ask about your catalog setup or type a command…"
-      value={chatInput}
-      onChange={(e) => setChatInput(e.target.value)}
-      onKeyDown={(e) => {
-        if (e.key === "Enter") {
-          handleChatSubmit();
-        }
-      }}
-      className="w-full pr-11"
-    />
+            <div className="flex items-end gap-2">
+              <Textarea
+                ref={chatInputRef as any}
+                placeholder="Ask about your catalog setup or type a command…"
+                value={chatInput}
+                onChange={(e) => setChatInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    // While waiting for API, ignore Enter
+                    if (isTyping) {
+                      e.preventDefault();
+                      return;
+                    }
+                    e.preventDefault();
+                    handleChatSubmit();
+                  }
+                }}
+                rows={1}
+                className="w-full resize-none max-h-40 min-h-[44px] rounded-2xl border border-gray-300 bg-white px-4 py-2 text-sm shadow-sm focus-visible:ring-1 focus-visible:ring-[#2B6CF3]"
+              />
 
-    <Button
-      type="button"
-      size="icon"
-      onClick={handleChatSubmit}
-      disabled={!chatInput.trim()}
-      className="absolute right-2 top-1/2 -translate-y-1/2 bg-[#2B6CF3] hover:bg-[#2456c9] disabled:opacity-50 disabled:cursor-not-allowed"
-    >
-      <Send className="h-4 w-4" />
-    </Button>
-  </div>
+              <Button
+                type="button"
+                size="icon"
+                onClick={handleChatSubmit}
+                disabled={!chatInput.trim()}
+                className="mb-1 h-9 w-9 rounded-full bg-[#2B6CF3] hover:bg-[#2456c9] disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center"
+              >
+                <Send className="h-4 w-4" />
+              </Button>
+            </div>
 
-  <p className="mt-2 text-xs text-gray-500">
-    Try commands: /validate, /catalog status, /sync, /help
-  </p>
-</div>
-
+            <p className="mt-2 text-xs text-gray-500">
+              Try commands: <span className="font-medium">/validate</span>,{" "}
+              <span className="font-medium">/catalog status</span>,{" "}
+              <span className="font-medium">/sync</span>,{" "}
+              <span className="font-medium">/help</span>
+            </p>
+          </div>
         </div>
 
-        {/* Right Panel - Zuora Workspace */}
+        {/* Right Panel - max-h-[95vh]  Zuora Workspace */}
         <div
-          className="w-[60%] overflow-y-auto p-8"
+          className="w-[40%]   overflow-y-auto p-8 pt-[68px]"
           style={{ overscrollBehavior: "contain" }}
         >
           {!isConnected ? (
@@ -2588,7 +3168,6 @@ const handleCopyPayload = async () => {
 
                 <div className="space-y-6">
                   <div>
-                    {/* Environment */}
                     <Label
                       htmlFor="environment"
                       className="text-sm font-medium text-gray-700"
@@ -2618,7 +3197,6 @@ const handleCopyPayload = async () => {
                   </div>
 
                   <div>
-                    {/* Client ID */}
                     <Label
                       htmlFor="clientId"
                       className="text-sm font-medium text-gray-700"
@@ -2643,7 +3221,6 @@ const handleCopyPayload = async () => {
                   </div>
 
                   <div>
-                    {/* Client Secret */}
                     <Label
                       htmlFor="clientSecret"
                       className="text-sm font-medium text-gray-700"
@@ -2700,89 +3277,198 @@ const handleCopyPayload = async () => {
               </div>
             </div>
           ) : (
-            <div>
-        {showPayload && (
-  <Card className="mb-6">
-    <CardHeader
-      className="flex cursor-pointer items-center justify-between"
-      onClick={() => setIsPayloadExpanded((prev) => !prev)}
-    >
-      <div>
-        <CardTitle>Product Payload Preview</CardTitle>
-        <CardDescription>
-          JSON payload ready to send to Zuora API (editable)
-        </CardDescription>
-      </div>
-      <ChevronDown
-        className={`h-4 w-4 text-gray-500 transition-transform ${
-          isPayloadExpanded ? "rotate-180" : ""
-        }`}
-      />
-    </CardHeader>
+            <div className="space-y-6">
+              {/* 🔥 PARENT SCROLL WRAPPER */}
+              <div className="max-h-[75vh]   overflow-y-auto pr-2">
+                {/* 3-step preview (Product, Rate Plan, Charge) */}
+                {showPayload && zuoraSteps.length > 0 && (
+                  <div className="space-y-6">
+                    {zuoraSteps.map((step, index) => (
+                      <Card key={step.id}>
+                        <CardHeader
+                          onClick={() =>
+                            setZuoraSteps((prev) =>
+                              prev.map((s) =>
+                                s.id === step.id
+                                  ? { ...s, expanded: !s.expanded }
+                                  : s
+                              )
+                            )
+                          }
+                          className="cursor-pointer"
+                        >
+                          <div className="flex justify-between gap-3">
+                            {/* left: title + description */}
+                            <div className="space-y-1 min-w-0">
+                              <CardTitle className="text-base font-semibold">
+                                {step.title || `Step ${index + 1}`}
+                              </CardTitle>
+                              <CardDescription className="text-sm text-muted-foreground">
+                                {step.description}
+                              </CardDescription>
+                            </div>
 
-    {isPayloadExpanded && (
-      <CardContent>
-        {/* Editable JSON textarea */}
-        <textarea
-          className="h-64 w-full resize-y rounded-lg border border-slate-700 bg-slate-900 p-4 font-mono text-xs text-green-400 outline-none"
-          value={apiPayloadText ?? generateProductPayload()}
-          onChange={(e) => setApiPayloadText(e.target.value)}
-          spellCheck={false}
-        />
+                            {/* right: copy icon + chevron, aligned at end */}
+                            <div className="flex items-center gap-2 shrink-0">
+                              <Button
+                                size="icon"
+                                variant="outline"
+                                className="h-8 w-8"
+                                onClick={async (e) => {
+                                  e.stopPropagation(); // don't toggle expand
+                                  try {
+                                    await navigator.clipboard.writeText(
+                                      step.json
+                                    );
+                                    setToastMessage({
+                                      message: `Copied ${
+                                        step.title || `Step ${index + 1}`
+                                      } payload`,
+                                      type: "success",
+                                    });
+                                  } catch {
+                                    setToastMessage({
+                                      message:
+                                        "Copy failed. Please copy manually.",
+                                      type: "error",
+                                    });
+                                  }
+                                }}
+                              >
+                                {/* your copy SVG/icon */}
+                                <svg
+                                  className="w-4 h-4"
+                                  viewBox="0 0 24 24"
+                                  fill="none"
+                                  stroke="currentColor"
+                                  strokeWidth="1.5"
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                >
+                                  <rect
+                                    x="9"
+                                    y="9"
+                                    width="13"
+                                    height="13"
+                                    rx="2"
+                                    ry="2"
+                                  />
+                                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                                </svg>
+                              </Button>
 
-        <div className="mt-4 flex gap-2">
-          <Button
-            className="bg-[#2B6CF3] hover:bg-[#2456c9]"
-            onClick={handleValidation}
-          >
-            Validate &amp; Deploy
-          </Button>
-          <Button
-            variant="outline"
-            onClick={handleCopyPayload}
-            disabled={copying}
-          >
-            {copying ? "Copying…" : "Copy to Clipboard"}
-          </Button>
-        </div>
-      </CardContent>
-    )}
-  </Card>
-)}
+                              <ChevronDown
+                                className={`h-4 w-4 transition-transform ${
+                                  step.expanded ? "rotate-180" : ""
+                                }`}
+                              />
+                            </div>
+                          </div>
+                        </CardHeader>
 
+                        {step.expanded && (
+                          <CardContent>
+                            {(step.error || step.jsonError) && (
+                              <div className="mb-3 rounded-lg border border-red-400 bg-red-50 p-3 text-xs text-red-700">
+                                {step.error || step.jsonError}
+                              </div>
+                            )}
 
-              {isConnected &&
-                showConnectedCard &&
-                currentFlow === "idle" &&
-                !showPayload && (
-                  <div className="mx-auto max-w-2xl">
-                    <Card className="border-green-200 bg-green-50">
-                      <CardContent className="flex items-center gap-3">
-                        <CheckCircle2 className="h-8 w-8 text-green-600" />
-                        <div>
-                          <h3 className="text-lg font-semibold text-green-900">
-                            ✅ Connected to Zuora
-                          </h3>
-                          <p className="text-sm text-green-700">
-                            Environment:{" "}
-                            {environment === "api-sandbox"
-                              ? "API Sandbox"
-                              : environment === "sandbox"
-                              ? "Sandbox / Test"
-                              : "Production"}
-                          </p>
-                        </div>
-                      </CardContent>
-                    </Card>
+                            <textarea
+                              // className="h-56 w-full rounded-lg border bg-slate-900 p-4 font-mono text-xs text-green-400"
+                              className=" h-56 w-full font-mono text-sm 
+                              bg-gray-100 text-blue-600 
+                               border-gray-300 
+                              rounded-md p-3 
+                               rounded-lg 
+                              focus:ring-2 focus:ring-blue-400"
+                              value={step.json}
+                              spellCheck={false}
+                              onChange={(e) => {
+                                const val = e.target.value;
+                                setZuoraSteps((prev) =>
+                                  prev.map((s) => {
+                                    if (s.id !== step.id) return s;
+                                    let jsonError: string | null = null;
+                                    try {
+                                      if (val.trim()) JSON.parse(val);
+                                    } catch (err: any) {
+                                      jsonError = err.message;
+                                    }
+                                    return { ...s, json: val, jsonError };
+                                  })
+                                );
+                              }}
+                            />
+                          </CardContent>
+                        )}
+                      </Card>
+                    ))}
+
+                    {/* Button stays AFTER scroll area */}
                   </div>
                 )}
+
+                {isConnected &&
+                  showConnectedCard &&
+                  currentFlow === "idle" &&
+                  !showPayload && (
+                    <div className="mx-auto max-w-2xl">
+                      <Card className="border-green-200 bg-green-50">
+                        <CardContent className="flex items-center gap-3">
+                          <CheckCircle2 className="h-8 w-8 text-green-600" />
+                          <div>
+                            <h3 className="text-lg font-semibold text-green-900">
+                              ✅ Connected to Zuora
+                            </h3>
+                            <p className="text-sm text-green-700">
+                              Environment:{" "}
+                              {environment === "api-sandbox"
+                                ? "API Sandbox"
+                                : environment === "sandbox"
+                                ? "Sandbox / Test"
+                                : "Production"}
+                            </p>
+                          </div>
+                        </CardContent>
+                      </Card>
+                    </div>
+                  )}
+              </div>
+              {showPayload && zuoraSteps.length > 0 && (
+                <div className="flex flex-col items-center gap-1">
+                  <Button
+                    onClick={handleExecute}
+                    disabled={
+                      !zuoraSteps.length ||
+                      isExecuting ||
+                      executing ||
+                      zuoraSteps.some((s) => s.jsonError) ||
+                      // 🔴 disable if any payload still has PLACEHOLDER text
+                      zuoraSteps.some((s) => s.json?.includes("PLACEHOLDER"))
+                    }
+                    className="bg-blue-600 text-white hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed"
+                  >
+                    Send to Zuora
+                  </Button>
+                  {/*       
+        {zuoraActionLabel && (
+          <p className="text-xs text-gray-500 text-center">
+            {zuoraActionLabel}
+          </p>
+        )} */}
+                </div>
+              )}
             </div>
           )}
         </div>
       </div>
-
       {toastMessage && (
-        <Toast message={toastMessage} onClose={() => setToastMessage(null)} />
+        <Toast
+          message={toastMessage.message}
+          type={toastMessage.type}
+          onClose={() => setToastMessage(null)}
+        />
       )}
     </div>
   );
