@@ -865,7 +865,7 @@ export default function WorkflowPage() {
 
   // [CHAT-API] Persona + Conversation ID
   const CHAT_API_URL =
-    "https://7ajwemkf19.execute-api.us-east-2.amazonaws.com/demo/chat";
+    "https://aglx6ee841.execute-api.us-east-2.amazonaws.com/dev/chat";
   const CHAT_PERSONA = "ProductManager";
 
   const [conversationId, setConversationId] = useState<string>(() => {
@@ -923,49 +923,22 @@ export default function WorkflowPage() {
     setErrors(next);
     return Object.keys(next).length === 0;
   };
-  // 🔁 Whenever we switch conversations, rebuild the Zuora workspace
-  useEffect(() => {
-    if (!activeConversationId) return;
-
-    const items =
-      activeConversationId && conversationPayloads[activeConversationId]
-        ? conversationPayloads[activeConversationId]
-        : [];
-
-
-
-    const restoredSteps = buildZuoraStepsFromPayloads(
-      activeConversationId,
-      items
-    );
-
-    setZuoraSteps(restoredSteps);
-    setShowPayload(true);
-  }, [activeConversationId, conversationPayloads]);
-
+ 
 
   useEffect(() => {
     if (!activeConversationId) return;
   
     const items = conversationPayloads[activeConversationId];
-  
-    // 🟥 No payloads yet → hide preview
     if (!items || items.length === 0) {
       setZuoraSteps([]);
-      // setShowPayload(false);
+      setShowPayload(false);
       return;
     }
   
-    // 🟢 Payloads exist → build + show preview
-    const restoredSteps = buildZuoraStepsFromPayloads(
-      activeConversationId,
-      items
-    );
-  
-    setZuoraSteps(restoredSteps);
+    setZuoraSteps(buildZuoraStepsFromPayloads(activeConversationId, items));
     setShowPayload(true);
   }, [activeConversationId, conversationPayloads]);
-
+  
   
   // 🟥 HYDRATION DEBUG LOGGER
 
@@ -1428,10 +1401,9 @@ export default function WorkflowPage() {
         // );
 
         // Save raw (but normalized) payloads per conversation
-        setConversationPayloads((prev) => ({
-          ...prev,
-          [safeConvId]: items,
-        }));
+        setZuoraSteps(newSteps);
+        setShowPayload(true);
+        
       }
 
       // --------------------------

@@ -178,9 +178,9 @@ interface StoredConversationSummary {
   updatedAt: string;
 }
 
-const CHAT_CONVERSATIONS_KEY = "pm_chat_conversations_v1";
-const CHAT_MESSAGES_KEY_PREFIX = "pm_chat_messages_v1";
-const CHAT_ZUORA_PAYLOADS_KEY = "pm_chat_zuora_payloads_v1";
+const CHAT_CONVERSATIONS_KEY = "arct_chat_conversations_v1";
+const CHAT_MESSAGES_KEY_PREFIX = "arct_chat_messages_v1";
+const CHAT_ZUORA_PAYLOADS_KEY = "arct_chat_zuora_payloads_v1";
 
 const deriveTitleFromMessages = (messages: ChatMessage[]): string => {
   if (!messages || messages.length === 0) return "New chat";
@@ -259,10 +259,9 @@ function ChatHistorySidebar({
   onSelectConversation,
   onDeleteConversation,
   onStartAction,
-  sortOrder,       // ✅ ADD
-  onToggleSort,    // ✅ ADD
+  sortOrder, // ✅ ADD
+  onToggleSort, // ✅ ADD
 }: ChatHistorySidebarProps) {
-
   return (
     <aside className="hidden w-64 pt-[80px] flex-col border-r border-gray-200 bg-white/80 p-3 md:flex">
       {/* CHAT HISTORY - 40% HEIGHT */}
@@ -720,7 +719,7 @@ export default function WorkflowPage() {
     {
       role: "assistant",
       content:
-        "Hi, I'm Zia — your AI  Architect. Let's connect to Zuora and manage your Product Catalog.",
+        "I’m Zia — your AI Architect. Let’s connect to Zuora and get started.",
       timestamp: new Date(),
     },
   ]);
@@ -756,7 +755,7 @@ export default function WorkflowPage() {
   });
 
   // ---- Conversation ID utilities ----
-  const CONV_STORAGE_PREFIX = "pm_conversation_id";
+  const CONV_STORAGE_PREFIX = "arct_conversation_id";
 
   const sanitizeConvId = (id?: string | null) => {
     if (!id) return null;
@@ -791,10 +790,10 @@ export default function WorkflowPage() {
 
     const key = storageKeyForPersona(persona);
 
-    // migrate old key if it exists (legacy: "pm_conversation_id")
-    const legacy = sanitizeConvId(sessionStorage.getItem("pm_conversation_id"));
+    // migrate old key if it exists (legacy: "arct_conversation_id")
+    const legacy = sanitizeConvId(sessionStorage.getItem("arct_conversation_id"));
     if (legacy) {
-      sessionStorage.removeItem("pm_conversation_id");
+      sessionStorage.removeItem("arct_conversation_id");
       sessionStorage.setItem(key, legacy);
     }
 
@@ -865,8 +864,8 @@ export default function WorkflowPage() {
 
   // [CHAT-API] Persona + Conversation ID
   const CHAT_API_URL =
-    "https://7ajwemkf19.execute-api.us-east-2.amazonaws.com/demo/chat";
-  const CHAT_PERSONA = "ProductManager";
+    "https://aglx6ee841.execute-api.us-east-2.amazonaws.com/dev/chat";
+  const CHAT_PERSONA = "BillingArchitect";
 
   const [conversationId, setConversationId] = useState<string>(() => {
     return getOrCreateConversationId(CHAT_PERSONA);
@@ -902,19 +901,18 @@ export default function WorkflowPage() {
   }>(null);
   const touchConversation = (convId: string) => {
     const nowIso = new Date().toISOString();
-  
+
     setConversations((prev) => {
       const idx = prev.findIndex((c) => c.id === convId);
       if (idx === -1) return prev;
-  
+
       const updated = { ...prev[idx], updatedAt: nowIso };
       const others = prev.filter((c) => c.id !== convId);
-  
+
       return [updated, ...others]; // 🔥 reorder ONLY here
     });
   };
 
-      
   const validateConnectForm = () => {
     const next: typeof errors = {};
     if (!environment) next.environment = "Please select an environment.";
@@ -923,50 +921,20 @@ export default function WorkflowPage() {
     setErrors(next);
     return Object.keys(next).length === 0;
   };
-  // 🔁 Whenever we switch conversations, rebuild the Zuora workspace
   useEffect(() => {
     if (!activeConversationId) return;
 
-    const items =
-      activeConversationId && conversationPayloads[activeConversationId]
-        ? conversationPayloads[activeConversationId]
-        : [];
-
-
-
-    const restoredSteps = buildZuoraStepsFromPayloads(
-      activeConversationId,
-      items
-    );
-
-    setZuoraSteps(restoredSteps);
-    setShowPayload(true);
-  }, [activeConversationId, conversationPayloads]);
-
-
-  useEffect(() => {
-    if (!activeConversationId) return;
-  
     const items = conversationPayloads[activeConversationId];
-  
-    // 🟥 No payloads yet → hide preview
     if (!items || items.length === 0) {
       setZuoraSteps([]);
-      // setShowPayload(false);
+      setShowPayload(false);
       return;
     }
-  
-    // 🟢 Payloads exist → build + show preview
-    const restoredSteps = buildZuoraStepsFromPayloads(
-      activeConversationId,
-      items
-    );
-  
-    setZuoraSteps(restoredSteps);
+
+    setZuoraSteps(buildZuoraStepsFromPayloads(activeConversationId, items));
     setShowPayload(true);
   }, [activeConversationId, conversationPayloads]);
 
-  
   // 🟥 HYDRATION DEBUG LOGGER
 
   useEffect(() => {
@@ -1195,7 +1163,7 @@ export default function WorkflowPage() {
   useEffect(() => {
     if (typeof window === "undefined") return;
     if (!activeConversationId) return;
-  
+
     try {
       const serialized = chatMessages.map((m) => ({
         role: m.role,
@@ -1203,25 +1171,22 @@ export default function WorkflowPage() {
         timestamp: m.timestamp.toISOString(),
         fromApi: m.fromApi === true,
       }));
-  
+
       localStorage.setItem(
         `${CHAT_MESSAGES_KEY_PREFIX}:${activeConversationId}`,
         JSON.stringify(serialized)
       );
-  
+
       // ✅ ONLY update title here (safe)
       const title = deriveTitleFromMessages(chatMessages);
-  
+
       setConversations((prev) =>
-        prev.map((c) =>
-          c.id === activeConversationId ? { ...c, title } : c
-        )
+        prev.map((c) => (c.id === activeConversationId ? { ...c, title } : c))
       );
     } catch {
       // ignore
     }
   }, [chatMessages, activeConversationId]);
-  
 
   useEffect(() => {
     if (chatContainerRef.current && isUserAtBottom) {
@@ -1259,35 +1224,33 @@ export default function WorkflowPage() {
 
   const addAssistantMessage = (content: string, delay = 300) => {
     setIsTyping(true);
-  
+
     setTimeout(() => {
       setIsTyping(false);
-  
+
       setChatMessages((prev) => [
         ...prev,
         { role: "assistant", content, timestamp: new Date(), fromApi: true },
       ]);
-  
+
       if (activeConversationId) {
         touchConversation(activeConversationId);
       }
-  
+
       requestAnimationFrame(() => scrollToBottom(true));
     }, delay);
   };
-  
 
   const addUserMessage = (content: string) => {
     setChatMessages((prev) => [
       ...prev,
       { role: "user", content, timestamp: new Date() },
     ]);
-  
+
     if (activeConversationId) {
       touchConversation(activeConversationId);
     }
   };
-  
 
   const actionPromptMap: Record<Exclude<ConversationFlow, "idle">, string> = {
     "create-product": "I want to create a product.",
@@ -1428,10 +1391,8 @@ export default function WorkflowPage() {
         // );
 
         // Save raw (but normalized) payloads per conversation
-        setConversationPayloads((prev) => ({
-          ...prev,
-          [safeConvId]: items,
-        }));
+        setZuoraSteps(newSteps);
+        setShowPayload(true);
       }
 
       // --------------------------
@@ -1544,7 +1505,7 @@ export default function WorkflowPage() {
       });
 
       addAssistantMessage(
-        "Great! You're now connected. What would you like to do firsts",
+        "Great! You're now connected. What would you like to do first?",
         600
       );
     } catch (e: any) {
@@ -2494,9 +2455,9 @@ export default function WorkflowPage() {
     });
 
     // Also remove from localStorage (if you persist it)
-    const saved = JSON.parse(localStorage.getItem("pm_chat_payloads") || "{}");
+    const saved = JSON.parse(localStorage.getItem("arct_chat_payloads") || "{}");
     delete saved[convId];
-    localStorage.setItem("pm_chat_payloads", JSON.stringify(saved));
+    localStorage.setItem("arct_chat_payloads", JSON.stringify(saved));
   };
 
   const generateProductPayload = () => {
@@ -2702,9 +2663,7 @@ export default function WorkflowPage() {
       {/* Page Title */}
       <div className="mb-1 bg-white/70 backdrop-blur supports-[backdrop-filter]:bg-white/60">
         <div className="flex h-14 max-w-7xl items-center px-6">
-          <h1 className="text-base font-semibold text-gray-900">
-            Architect
-          </h1>
+          <h1 className="text-base font-semibold text-gray-900">Architect</h1>
         </div>
       </div>
       <div className="flex flex-1 overflow-hidden min-h-0">
